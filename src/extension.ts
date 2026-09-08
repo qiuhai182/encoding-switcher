@@ -154,6 +154,16 @@ function vscodeEncodingLabel(enc: string): string {
   return isUtfFamily(enc) ? "utf8" : enc;
 }
 
+// 内部重开标记：重开流程重建文档模型会再次触发 onDidOpenTextDocument，
+// 用标记区分“内部重开”与“用户真实打开”，避免把内部事件当作用户打开而造成循环
+const internalReopen = new Set<string>();
+
+function markInternalReopen(uri: vscode.Uri): void {
+  const key = uri.toString();
+  internalReopen.add(key);
+  setTimeout(() => internalReopen.delete(key), 5000);
+}
+
 // ===== 侦查内核的“指定编码重开”命令 =====
 // 不同内核命令 ID 可能不同（Trae SOLO 已移除标准 ID），
 // 激活时扫描一次并缓存；找不到时把内核所有编码相关命令写日志，便于排查
@@ -336,15 +346,18 @@ class EncodingViewProvider implements vscode.FileSystemProvider {
     }
   }
 
+  // 该文件的编码编辑器当前是否处于打开状态
+  isOpen(fsPath: string): boolean {
+    const viewUri = this.opened.get(fsPath.toLowerCase());
+    return !!viewUri && !!findByUri(viewUri);
+  }
+
   dispose(): void {
     this.emitter.dispose();
   }
 }
 
 let encodingView: EncodingViewProvider | undefined;
-
-// 自动弹视图记录：uri → 磁盘指纹，同一状态只自动弹一次
-const autoViewOpened = new Map<string, string>();
 
 // ===== 核心：指定编码重开，并用“实际显示内容”验证 =====
 //
@@ -398,6 +411,7 @@ async function reopenDisplayedCorrectly(
   // 首选：命令式指定编码重开（使用侦查到的内核命令）
   if (reopenEncodingCmd) {
     try {
+      markInternalReopen(uri); // 重开会重建文档模型，标记为内部事件
       await vscode.commands.executeCommand(
         reopenEncodingCmd,
         uri,
@@ -447,6 +461,7 @@ async function reopenDisplayedCorrectly(
 
     let reopened = false;
     try {
+      markInternalReopen(uri); // 重开会重建文档模型，标记为内部事件
       const nd = await vscode.workspace.openTextDocument(uri);
       await vscode.window.showTextDocument(nd, { preview: false });
       reopened = true;
@@ -463,12 +478,9 @@ async function reopenDisplayedCorrectly(
   L(`全部重开策略失败：${uri.fsPath}`);
   // 兜底：非 UTF 系编码文件无法纠正显示时，打开按对应编码解码的可编辑视图
   // 保证内容可读可编辑（编辑器文本不落盘时原文件字节不变；Ctrl+S 按对应编码写回）。
-  // 同一文件同一磁盘状态只自动弹一次，之后用户手动打开原文件不再抢标签
+  // 该文件的编码编辑器当前没开着才打开；已开着说明正在正确显示，无需重复
   if (!isUtfFamily(encLabel) && encodingView) {
-    const key = uri.toString();
-    const fp = diskFingerprint(uri);
-    if (autoViewOpened.get(key) !== fp) {
-      autoViewOpened.set(key, fp);
+    if (!encodingView.isOpen(uri.fsPath)) {
       try {
         await encodingView.open(uri.fsPath, encLabel);
         void vscode.window.showInformationMessage(
@@ -988,9 +1000,19 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.workspace.onDidOpenTextDocument((doc) => {
       scheduleContextUpdate();
-      if (doc.uri.scheme === "file") {
-        scheduleAutoReopen(doc.uri);
+      if (doc.uri.scheme !== "file") {
+        return;
       }
+      const key = doc.uri.toString();
+      if (internalReopen.has(key)) {
+        // 内部重开流程重建模型触发的事件，不是用户打开，避免重复处理造成循环
+        internalReopen.delete(key);
+        return;
+      }
+      // 用户真实（重新）打开：清除历史结论，重新完整检测纠正
+      autoDone.delete(key);
+      reopenCooldown.delete(key);
+      scheduleAutoReopen(doc.uri);
     })
   );
   // 外部改写（AI/工具直接写文件）：内核按旧编码标签解码新字节会导致乱码显示，
