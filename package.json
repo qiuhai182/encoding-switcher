@@ -1,12 +1,12 @@
 {
   "name": "encoding-switcher",
-  "displayName": "编码自动切换器 (GB2312/UTF-8)",
-  "description": "自动检测文件编码并以正确编码打开，防止中文乱码；支持 UTF-8 与 GB2312 一键互相切换",
+  "displayName": "编码自动切换器 (GBK/GB18030/UTF-8)",
+  "description": "自动检测文件编码并以正确编码打开，防止中文乱码；支持 UTF-8 与 GBK/GB18030 一键互相切换",
   "version": "0.6.0",
   "license": "MIT",
   "keywords": [
     "encoding",
-    "GB2312",
+    "GB18030",
     "GBK",
     "UTF-8",
     "乱码",

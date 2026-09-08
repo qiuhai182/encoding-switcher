@@ -204,23 +204,89 @@ async function detectReopenEncodingCmd(): Promise<void> {
 
 const VIEW_SCHEME = "encoding-view";
 
-// 正确编码只读视图：以指定编码解码原文件字节后展示，保证中文可读。
-// 视图为只读（原文件字节保持不变），文件被外部修改时自动刷新。
-class EncodingViewProvider implements vscode.TextDocumentContentProvider {
-  private emitter = new vscode.EventEmitter<vscode.Uri>();
-  readonly onDidChange = this.emitter.event;
+// 正确编码可读写编辑器：以指定编码解码/编码读写原文件，
+// 让“内核猜错编码”的文件拥有可编辑、可保存的正常编辑器（等效于按编码重开）。
+// 编辑器文本 ⇄ 原文件字节 的桥接规则：
+//   读：原文件字节 --指定编码解码--> 正确文本 --UTF-8--> 编辑器
+//   存：编辑器文本 --UTF-8 解码--> 正确文本 --指定编码编码--> 写回原文件
+class EncodingViewProvider implements vscode.FileSystemProvider {
+  private emitter = new vscode.EventEmitter<vscode.FileChangeEvent[]>();
+  readonly onDidChangeFile = this.emitter.event;
 
   // 已打开的视图：fsPath(小写) → 视图 uri，用于文件变化时刷新
   private opened = new Map<string, vscode.Uri>();
 
-  provideTextDocumentContent(uri: vscode.Uri): string {
+  // 视图 uri（encoding-view://<编码>/<encodeURIComponent(路径)>）→ 磁盘路径
+  private toFsPath(uri: vscode.Uri): string {
+    return decodeURIComponent(uri.path.replace(/^\/+/, ""));
+  }
+
+  private encOf(uri: vscode.Uri): string {
+    return uri.authority === "utf8" ? "utf-8" : uri.authority;
+  }
+
+  stat(uri: vscode.Uri): vscode.FileStat {
+    const s = fs.statSync(this.toFsPath(uri));
+    return {
+      type: vscode.FileType.File,
+      ctime: s.ctimeMs,
+      mtime: s.mtimeMs,
+      size: s.size,
+    };
+  }
+
+  readFile(uri: vscode.Uri): Uint8Array {
+    const fsPath = this.toFsPath(uri);
+    const text = iconv.decode(fs.readFileSync(fsPath), this.encOf(uri));
+    return new Uint8Array(Buffer.from(text, "utf-8"));
+  }
+
+  writeFile(uri: vscode.Uri, content: Uint8Array): void {
+    const fsPath = this.toFsPath(uri);
+    const openEnc = this.encOf(uri);
+    const text = Buffer.from(content).toString("utf-8");
+    // 写回前检测文件当前实际编码，写回编码跟随实际编码而非打开时的固定编码；
+    // 实际编码与打开时不一致（被外部改写）则阻止保存，防止覆盖外部修改
+    let curEnc = openEnc;
     try {
-      const fsPath = decodeURIComponent(uri.path.replace(/^\/+/, ""));
-      const enc = uri.authority === "utf8" ? "utf-8" : uri.authority;
-      return iconv.decode(fs.readFileSync(fsPath), enc);
-    } catch (e) {
-      return `无法读取文件: ${String(e)}`;
+      const detected = detectEncoding(
+        fs.readFileSync(fsPath),
+        getDetectionEncodings()
+      );
+      if (detected !== "unknown") {
+        curEnc = detected;
+      }
+    } catch {
+      // 文件可能已被删除，交给下方 writeFileSync 报错
     }
+    const encChanged =
+      !isUtfFamily(curEnc) && !isUtfFamily(openEnc) && curEnc !== openEnc;
+    if (encChanged) {
+      // 每阻止一次乱码保存，就警告一次，让用户知道有内容被拦下
+      const msg =
+        `已阻止一次乱码保存：文件实际编码已变为 ${curEnc}（打开时为 ${openEnc}），` +
+        `继续写入会导致中文损坏。请关闭本编辑器后重新打开文件`;
+      L(`已阻止乱码保存：${fsPath}（${openEnc} → ${curEnc}）`);
+      void vscode.window.showWarningMessage(msg);
+      throw vscode.FileSystemError.NoPermissions(msg);
+    }
+    fs.writeFileSync(fsPath, iconv.encode(text, curEnc));
+  }
+
+  readDirectory(): [] {
+    return [];
+  }
+  createDirectory(): void {
+    throw vscode.FileSystemError.NoPermissions();
+  }
+  delete(): void {
+    throw vscode.FileSystemError.NoPermissions();
+  }
+  rename(): void {
+    throw vscode.FileSystemError.NoPermissions();
+  }
+  watch(): vscode.Disposable {
+    return new vscode.Disposable(() => {});
   }
 
   async open(fsPath: string, encLabel: string): Promise<void> {
@@ -233,7 +299,7 @@ class EncodingViewProvider implements vscode.TextDocumentContentProvider {
       viewColumn: vscode.ViewColumn.Beside,
       preview: false,
     });
-    // 单视图：关闭原乱码文件的编辑器标签，只保留正确编码视图。
+    // 单视图：关闭原乱码文件的编辑器标签，只保留正确编码编辑器。
     // 优先用 tabGroups API 按标签直接关闭（不依赖激活状态）；
     // 内核裁剪该 API 时退回“激活后关当前编辑器”的老方法
     const isTargetTab = (t: vscode.Tab): boolean =>
@@ -266,7 +332,7 @@ class EncodingViewProvider implements vscode.TextDocumentContentProvider {
   refresh(fsPath: string): void {
     const viewUri = this.opened.get(fsPath.toLowerCase());
     if (viewUri) {
-      this.emitter.fire(viewUri);
+      this.emitter.fire([{ type: vscode.FileChangeType.Changed, uri: viewUri }]);
     }
   }
 
@@ -406,7 +472,7 @@ async function reopenDisplayedCorrectly(
       try {
         await encodingView.open(uri.fsPath, encLabel);
         void vscode.window.showInformationMessage(
-          `内核不支持自动编码重开，已打开 ${encLabel.toUpperCase()} 只读视图（原文件未做任何修改）`
+          `内核不支持自动编码重开，已打开 ${encLabel.toUpperCase()} 编码编辑器（可编辑，Ctrl+S 按原编码保存回文件）`
         );
       } catch (e) {
         L(`打开编码视图失败: ${String(e)}`);
@@ -880,12 +946,14 @@ export function activate(context: vscode.ExtensionContext) {
     })
   );
 
-  // 注册正确编码只读视图 provider（内核重开命令缺失时的兜底显示）
+  // 注册正确编码可读写文件系统（内核重开命令缺失时的兜底：等效按编码重开的可编辑器）
   const viewProvider = new EncodingViewProvider();
   encodingView = viewProvider;
   context.subscriptions.push(
     viewProvider,
-    vscode.workspace.registerTextDocumentContentProvider(VIEW_SCHEME, viewProvider)
+    vscode.workspace.registerFileSystemProvider(VIEW_SCHEME, viewProvider, {
+      isCaseSensitive: true,
+    })
   );
 
   // 内核猜码设置：默认不干预（部分内核对候选列表支持不佳，强制写入会破坏猜测）。
