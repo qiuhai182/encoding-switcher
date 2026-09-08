@@ -8,3 +8,6 @@ Sync_Master_Send.c
 .vscode/**
 **/.DS_Store
 .gitignore
+build.bat
+upLoad.sh
+参考.txt

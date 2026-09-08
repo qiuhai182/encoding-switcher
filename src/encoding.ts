@@ -1,31 +1,22 @@
-// 编码检测工具模块
+// 编码检测工具模块（通用化：候选编码由调用方传入，不限定具体编码）
 // 设计思路：
 // 1. 先判断是否为 UTF-8 BOM（EF BB BF），命中返回 "utf-8"。
 // 2. 否则判是否为合法 UTF-8（无 BOM），命中返回 "utf8"（VSCode 中 = UTF-8 无 BOM）。
 //    注意：VSCode 编码标签里 "utf-8" 带 BOM，"utf8" 不带 BOM，二者不可混用。
-// 3. 若不是 UTF-8，则按 GBK 解码尝试，并进一步区分 GB2312（GBK 的子集）。
-// 4. 返回检测到的编码标签，供重新打开或转换使用。
+// 3. 若不是 UTF-8，按调用方传入的候选编码列表依次试解码，
+//    无替换字符（U+FFFD）即视为命中，返回该编码名。
+// 4. 全部失败返回 "unknown"。
 
 import * as iconv from "iconv-lite";
 
-// 与 VSCode 编码标签对齐：
-//  "utf-8"  = UTF-8 with BOM
-//  "utf8"    = UTF-8 without BOM
-//  "gbk"     = GBK
-//  "gb2312"  = GB2312
-export type DetectedEncoding =
-  | "utf-8"
-  | "utf8"
-  | "gbk"
-  | "gb2312"
-  | "unknown";
+// 检测结果："utf-8" = UTF-8 with BOM；"utf8" = UTF-8 无 BOM；
+// "unknown" = 无法识别；其余为调用方候选列表中的编码名（iconv-lite 支持的编码）
+export type DetectedEncoding = "utf-8" | "utf8" | "unknown" | (string & {});
 
 // 判断字节序列是否为合法 UTF-8（不含 BOM 判定，调用方已处理 BOM）
 export function isUtf8(bytes: Uint8Array): boolean {
   let i = 0;
   const n = bytes.length;
-
-  // 不含 BOM 跳过逻辑
 
   while (i < n) {
     const b0 = bytes[i];
@@ -72,7 +63,7 @@ export function isUtf8(bytes: Uint8Array): boolean {
   return true;
 }
 
-// 用 iconv-lite 做权威解码（gbk 与 gb2312 标签）
+// 用 iconv-lite 做权威解码
 // iconv-lite 遇无法解码字节会输出替换字符 U+FFFD（不抛错），需自行判定为非法
 function decodeWith(encoding: string, bytes: Uint8Array): string | null {
   try {
@@ -86,8 +77,12 @@ function decodeWith(encoding: string, bytes: Uint8Array): string | null {
   }
 }
 
-// 主检测入口
-export function detectEncoding(bytes: Uint8Array): DetectedEncoding {
+// 主检测入口：candidates 为 UTF-8 之外的候选编码列表（按优先级排序），
+// 使用 iconv-lite 支持的编码名（如 gbk、gb18030、big5、shift_jis、cp1252 等）
+export function detectEncoding(
+  bytes: Uint8Array,
+  candidates: string[] = ["gbk", "gb18030"]
+): DetectedEncoding {
   if (bytes.length === 0) {
     return "utf8";
   }
@@ -107,15 +102,14 @@ export function detectEncoding(bytes: Uint8Array): DetectedEncoding {
     return "utf8";
   }
 
-  // 3. 尝试 GBK / GB2312 解码
-  const gbkText = decodeWith("gbk", bytes);
-  if (gbkText !== null) {
-    // 进一步判断是否为 GB2312（GB2312 是 GBK 的子集）
-    const gb2312Text = decodeWith("gb2312", bytes);
-    if (gb2312Text !== null) {
-      return "gb2312";
+  // 3. 依次尝试候选编码：可完整解码（无替换字符）即命中
+  for (const enc of candidates) {
+    if (enc === "utf8" || enc === "utf-8") {
+      continue; // 已在上面校验过
     }
-    return "gbk";
+    if (decodeWith(enc, bytes) !== null) {
+      return enc;
+    }
   }
 
   return "unknown";

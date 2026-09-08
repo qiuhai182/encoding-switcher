@@ -2,7 +2,7 @@
   "name": "encoding-switcher",
   "displayName": "编码自动切换器 (GB2312/UTF-8)",
   "description": "自动检测文件编码并以正确编码打开，防止中文乱码；支持 UTF-8 与 GB2312 一键互相切换",
-  "version": "0.5.3",
+  "version": "0.6.0",
   "license": "MIT",
   "keywords": [
     "encoding",
@@ -35,27 +35,56 @@
   "contributes": {
     "commands": [
       {
-        "command": "encoding-switcher.toggleToUtf8",
-        "title": "以UTF-8编码保存",
-        "category": "编码切换"
+        "command": "encoding-switcher.saveWithEncoding",
+        "title": "选择编码保存",
+        "category": "编码切换",
+        "icon": "$(file-code)"
       },
       {
-        "command": "encoding-switcher.toggleToGb2312",
-        "title": "以GB2312编码保存",
+        "command": "encoding-switcher.openEncodingView",
+        "title": "以正确编码查看",
         "category": "编码切换"
       }
-    ],
+      ],
+      "configuration": {
+        "title": "编码切换器",
+        "properties": {
+          "encoding-switcher.applyKernelGuess": {
+            "type": "boolean",
+            "default": false,
+            "markdownDescription": "把 `kernelGuessEncodings` 写入**当前工作区**的 `files.candidateGuessEncodings`（限制内核猜码范围）。**默认关闭**：部分内核/版本对候选列表支持不佳，强制写入会导致猜测失效、只回落默认编码"
+          },
+          "encoding-switcher.detectionEncodings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [
+              "gbk",
+              "gb18030"
+            ],
+            "markdownDescription": "UTF-8 之外要自动识别/纠正/转换的编码列表（按优先级排序，使用 iconv-lite 支持的编码名，如 `gbk`、`gb18030`、`big5`、`shift_jis`、`cp1252` 等）。命令面板「选择编码保存」与「以正确编码查看」的选项也来自此列表"
+          },
+          "encoding-switcher.kernelGuessEncodings": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "default": [
+              "utf8",
+              "gbk",
+              "gb18030"
+            ],
+            "markdownDescription": "激活时写入内核 `files.candidateGuessEncodings` 的候选编码。注意：候选中不要包含某编码的子集（如 gbk 之外再放 gb2312），子集编解码会损坏扩展字符"
+          }
+        }
+      },
     "menus": {
       "editor/title": [
         {
-          "command": "encoding-switcher.toggleToUtf8",
+          "command": "encoding-switcher.saveWithEncoding",
           "group": "navigation",
-          "when": "encoding-switcher:isGb2312"
-        },
-        {
-          "command": "encoding-switcher.toggleToGb2312",
-          "group": "navigation",
-          "when": "encoding-switcher:isUtf8"
+          "when": "encoding-switcher:isActive"
         }
       ]
     }
