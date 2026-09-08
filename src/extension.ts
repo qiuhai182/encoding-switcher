@@ -408,6 +408,14 @@ async function reopenDisplayedCorrectly(
     return true;
   }
 
+  // 复查：轮询窗口内用户可能已开始编辑（isDirty），立即放弃，
+  // 避免误把“用户正在编辑”当成“显示不正确”而触发重开
+  const dcNow = findByUri(uri);
+  if (dcNow && dcNow.isDirty) {
+    L(`放弃重开（用户正在编辑）：${uri.fsPath}`);
+    return false;
+  }
+
   // 首选：命令式指定编码重开（使用侦查到的内核命令）
   if (reopenEncodingCmd) {
     try {
@@ -430,6 +438,12 @@ async function reopenDisplayedCorrectly(
   // 只尝试一次：内核的猜测是确定性的（同样字节永远猜同样结果），
   // 多次关闭重开不会改变结果，失败即转只读视图，减少闪烁与等待
   for (let attempt = 1; attempt <= 1; attempt++) {
+    // 关闭编辑器前复查：用户可能已开始编辑（isDirty），绝不能关掉正在编辑的标签
+    const dc = findByUri(uri);
+    if (dc && dc.isDirty) {
+      L(`放弃重开（用户正在编辑）：${uri.fsPath}`);
+      return false;
+    }
     // 关闭该 uri 的所有编辑器，释放旧解码缓存的文档模型
     let closed = 0;
     for (const d of [...vscode.workspace.textDocuments]) {
@@ -704,10 +718,63 @@ function scheduleAutoReopen(uri: vscode.Uri, verifyAll = false): void {
       return;
     }
     const decodeName = isUtfFamily(enc) ? "utf-8" : enc;
-    const text = decodeFileBytes(uri.fsPath, decodeName);
+    let text = decodeFileBytes(uri.fsPath, decodeName);
     if (text === null) {
       L(`自动检测解码失败：${uri.fsPath}`);
       return;
+    }
+    // 编码歧义保护：编辑器当前显示与“按检测编码解码”的内容都无损坏（无 U+FFFD）
+    // 但不同 —— 说明文件字节存在多种自洽解码（如 GBK 字节恰好构成合法 UTF-8），
+    // 无法判定哪个正确，保守不重开，避免打断正常编辑/正常显示的文件
+    const shown = normalizeText(d.getText());
+    const expect = normalizeText(text);
+    if (
+      shown &&
+      expect &&
+      !shown.includes("\ufffd") &&
+      !expect.includes("\ufffd") &&
+      shown !== expect
+    ) {
+      autoDone.set(key, fp);
+      L(`显示内容无损坏但与磁盘解码不一致（编码歧义），保守不重开：${uri.fsPath}`);
+      return;
+    }
+    // 外部改写校验的二次确认：保存写入中、格式化瞬间等瞬态竞态会让
+    // “磁盘 vs 显示”暂时不一致，等待后重新比对，仍不一致才重开，
+    // 避免误重开正常编辑/正常保存的文件
+    if (verifyAll) {
+      await sleep(400);
+      const d2 = findByUri(uri);
+      if (!d2 || d2.isDirty) {
+        L(`放弃校验（文件正在被编辑）：${uri.fsPath}`);
+        return;
+      }
+      const fp2 = diskFingerprint(uri);
+      if (fp2 !== fp) {
+        autoDone.set(key, fp2); // 文件又变了，交由后续事件重新处理
+        return;
+      }
+      const rechecked = decodeFileBytes(uri.fsPath, decodeName);
+      if (rechecked === null) {
+        return;
+      }
+      const shown2 = normalizeText(d2.getText());
+      const expect2 = normalizeText(rechecked);
+      if (shown2 === expect2) {
+        L(`二次确认显示与磁盘一致，无需重开：${uri.fsPath}`);
+        return; // 此前为瞬态竞态误报
+      }
+      if (
+        shown2 &&
+        expect2 &&
+        !shown2.includes("\ufffd") &&
+        !expect2.includes("\ufffd")
+      ) {
+        autoDone.set(key, fp2);
+        L(`二次确认编码歧义（两种解码均无损坏），保守不重开：${uri.fsPath}`);
+        return;
+      }
+      text = rechecked; // 以二次确认时的最新内容为准
     }
     // 先登记（无论成败），防止事件风暴期间反复重试
     autoDone.set(key, fp);
