@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-rem encoding-switcher 构建脚本：安装依赖 -> 类型检查 -> esbuild 打包 -> 生成 vsix
+rem encoding-guard 构建脚本：安装依赖 -> 类型检查 -> esbuild 打包 -> 生成 vsix
 cd /d "%~dp0"
 
 if not exist node_modules (

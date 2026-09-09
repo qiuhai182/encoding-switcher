@@ -1,4 +1,4 @@
-# 编码自动切换器 (encoding-switcher)
+# 编码自动切换器 (encoding-guard)
 
 打开文件时**自动检测编码格式并以正确编码显示**；内核猜不对的文件自动打开**正确编码视图**；检测到 AI 写坏编码时**及时告警**。编码列表可配置，不写死 GBK——任何 iconv-lite 支持的编码都可适配。
 
@@ -26,9 +26,9 @@
 
 | 设置项 | 默认值 | 说明 |
 |---|---|---|
-| `encoding-switcher.detectionEncodings` | `["gbk", "gb18030"]` | UTF-8 之外要自动识别/纠正/转换的编码列表（iconv-lite 支持的编码名，如 `big5`、`shift_jis`、`cp1252` 等），按优先级排序 |
-| `encoding-switcher.kernelGuessEncodings` | `["utf8", "gbk", "gb18030"]` | 写入内核 `files.candidateGuessEncodings` 的候选编码 |
-| `encoding-switcher.applyKernelGuess` | `false` | 是否把上面列表写入内核猜码设置。**默认关闭**：部分内核对候选列表支持不佳，强制写入会导致猜测失效、只回落默认编码 |
+| `encoding-guard.detectionEncodings` | `["gbk", "gb18030"]` | UTF-8 之外要自动识别/纠正/转换的编码列表（iconv-lite 支持的编码名，如 `big5`、`shift_jis`、`cp1252` 等），按优先级排序 |
+| `encoding-guard.kernelGuessEncodings` | `["utf8", "gbk", "gb18030"]` | 写入内核 `files.candidateGuessEncodings` 的候选编码 |
+| `encoding-guard.applyKernelGuess` | `false` | 是否把上面列表写入内核猜码设置。**默认关闭**：部分内核对候选列表支持不佳，强制写入会导致猜测失效、只回落默认编码 |
 
 默认配置对中国 GBK 环境开箱即用；其他环境（Big5、Shift-JIS 等）修改 `detectionEncodings` 即可。
 
@@ -55,7 +55,7 @@
 
 ## 安装
 
-- 扩展面板右上角 `···` → **从 VSIX 安装...**，选择 `encoding-switcher-x.y.z.vsix`
+- 扩展面板右上角 `···` → **从 VSIX 安装...**，选择 `encoding-guard-x.y.z.vsix`
 - 本地开发调试：F5 启动扩展开发宿主窗口
 
 ## 构建

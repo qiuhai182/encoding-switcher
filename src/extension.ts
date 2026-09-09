@@ -58,7 +58,7 @@ function decodeFileBytes(filePath: string, encoding: string): string | null {
 // ===== 前提：启用内核自带的“自动猜测编码” =====
 //
 // 内核读取文件的流程支持 files.autoGuessEncoding + files.candidateGuessEncodings。
-// 候选编码由插件设置 encoding-switcher.kernelGuessEncodings 驱动（不写死）。
+// 候选编码由插件设置 encoding-guard.kernelGuessEncodings 驱动（不写死）。
 // 注意：候选里不要放“自己编码的子集”（如 GBK 候选旁放 gb2312）——
 // 内核按子集编码解码/回写会损坏超集扩展字符（AI 改写文件后乱码的常见根因）。
 
@@ -70,7 +70,7 @@ function isUtfFamily(enc: string): boolean {
 // 插件设置：UTF-8 之外要自动识别/纠正的编码（iconv-lite 支持的编码名）
 function getDetectionEncodings(): string[] {
   return vscode.workspace
-    .getConfiguration("encoding-switcher")
+    .getConfiguration("encoding-guard")
     .get<string[]>("detectionEncodings", ["gbk", "gb18030"])
     .filter((e) => !isUtfFamily(e));
 }
@@ -78,14 +78,14 @@ function getDetectionEncodings(): string[] {
 // 插件设置：写入内核 files.candidateGuessEncodings 的候选编码
 function getKernelGuessEncodings(): string[] {
   return vscode.workspace
-    .getConfiguration("encoding-switcher")
+    .getConfiguration("encoding-guard")
     .get<string[]>("kernelGuessEncodings", ["utf8", "gbk", "gb18030"]);
 }
 
 // 插件设置：是否把候选编码写入内核猜码设置（默认关闭，避免破坏内核原生猜测）
 function isApplyKernelGuess(): boolean {
   return vscode.workspace
-    .getConfiguration("encoding-switcher")
+    .getConfiguration("encoding-guard")
     .get<boolean>("applyKernelGuess", false);
 }
 
@@ -546,7 +546,7 @@ async function convertTo(targetEnc: string, targetLabel: string): Promise<void> 
   if (srcEnc === "unknown") {
     vscode.window.showWarningMessage(
       "无法识别当前文件编码（不在检测编码列表内），未做转换。" +
-        "可在设置 encoding-switcher.detectionEncodings 中添加候选编码"
+        "可在设置 encoding-guard.detectionEncodings 中添加候选编码"
     );
     return;
   }
@@ -601,7 +601,7 @@ async function convertTo(targetEnc: string, targetLabel: string): Promise<void> 
   vscode.window.showInformationMessage(`已切换为 ${targetLabel} 并保存`);
 }
 
-// 下拉选择目标编码后转换保存（编码列表由设置 encoding-switcher.detectionEncodings 驱动）
+// 下拉选择目标编码后转换保存（编码列表由设置 encoding-guard.detectionEncodings 驱动）
 interface EncodingPickItem extends vscode.QuickPickItem {
   enc: string;
 }
@@ -643,7 +643,7 @@ async function updateContext(): Promise<void> {
   }
   await vscode.commands.executeCommand(
     "setContext",
-    "encoding-switcher:isActive",
+    "encoding-guard:isActive",
     isActive
   );
 }
@@ -996,14 +996,14 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(log);
 
   context.subscriptions.push(
-    vscode.commands.registerCommand("encoding-switcher.saveWithEncoding", () => {
+    vscode.commands.registerCommand("encoding-guard.saveWithEncoding", () => {
       void pickAndConvert();
     })
   );
 
   // 手动打开当前文件的正确编码只读视图
   context.subscriptions.push(
-    vscode.commands.registerCommand("encoding-switcher.openEncodingView", () => {
+    vscode.commands.registerCommand("encoding-guard.openEncodingView", () => {
       const editor = vscode.window.activeTextEditor;
       if (!editor || editor.document.isUntitled || editor.document.uri.scheme !== "file") {
         void vscode.window.showWarningMessage("当前没有打开的本地文件");
@@ -1036,7 +1036,7 @@ export function activate(context: vscode.ExtensionContext) {
   );
 
   // 内核猜码设置：默认不干预（部分内核对候选列表支持不佳，强制写入会破坏猜测）。
-  // 开启 encoding-switcher.applyKernelGuess 后按工作区写入；
+  // 开启 encoding-guard.applyKernelGuess 后按工作区写入；
   // 关闭状态下自动恢复历史版本误写过的全局设置
   if (isApplyKernelGuess()) {
     void ensureAutoGuessEncoding();

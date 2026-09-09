@@ -1,8 +1,8 @@
 {
-  "name": "encoding-switcher",
+  "name": "encoding-guard",
   "displayName": "编码自动切换器 (GBK/GB18030/UTF-8)",
   "description": "自动检测文件编码并以正确编码打开，防止中文乱码；支持 UTF-8 与 GBK/GB18030 一键互相切换",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "license": "MIT",
   "keywords": [
     "encoding",
@@ -35,13 +35,13 @@
   "contributes": {
     "commands": [
       {
-        "command": "encoding-switcher.saveWithEncoding",
+        "command": "encoding-guard.saveWithEncoding",
         "title": "选择编码保存",
         "category": "编码切换",
         "icon": "$(file-code)"
       },
       {
-        "command": "encoding-switcher.openEncodingView",
+        "command": "encoding-guard.openEncodingView",
         "title": "以正确编码查看",
         "category": "编码切换"
       }
@@ -49,12 +49,12 @@
     "configuration": {
       "title": "编码切换器",
       "properties": {
-        "encoding-switcher.applyKernelGuess": {
+        "encoding-guard.applyKernelGuess": {
           "type": "boolean",
           "default": false,
           "markdownDescription": "把 `kernelGuessEncodings` 写入**当前工作区**的 `files.candidateGuessEncodings`（限制内核猜码范围）。**默认关闭**：部分内核/版本对候选列表支持不佳，强制写入会导致猜测失效、只回落默认编码"
         },
-        "encoding-switcher.detectionEncodings": {
+        "encoding-guard.detectionEncodings": {
           "type": "array",
           "items": {
             "type": "string"
@@ -65,7 +65,7 @@
           ],
           "markdownDescription": "UTF-8 之外要自动识别/纠正/转换的编码列表（按优先级排序，使用 iconv-lite 支持的编码名，如 `gbk`、`gb18030`、`big5`、`shift_jis`、`cp1252` 等）。命令面板「选择编码保存」与「以正确编码查看」的选项也来自此列表"
         },
-        "encoding-switcher.kernelGuessEncodings": {
+        "encoding-guard.kernelGuessEncodings": {
           "type": "array",
           "items": {
             "type": "string"
@@ -82,9 +82,9 @@
     "menus": {
       "editor/title": [
         {
-          "command": "encoding-switcher.saveWithEncoding",
+          "command": "encoding-guard.saveWithEncoding",
           "group": "navigation",
-          "when": "encoding-switcher:isActive"
+          "when": "encoding-guard:isActive"
         }
       ]
     }
