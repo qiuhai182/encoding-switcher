@@ -10,4 +10,6 @@ Sync_Master_Send.c
 .gitignore
 build.bat
 upLoad.sh
+*.vsix
+icon_raw.png
 参考.txt

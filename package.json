@@ -13,25 +13,33 @@
     "编码",
     "encoding converter"
   ],
-  "publisher": "leoy",
-  "author": "上了个大笔当",
+  "publisher": "GuGuDong",
+  "author": "咕咕咚",
   "repository": {
     "type": "git",
-    "url": "https://github.com/2633352305/encoding-switcher.git"
+    "url": "https://github.com/qiuhai182/encoding-switcher.git"
   },
   "bugs": {
-    "email": "2633352305@qq.com"
+    "email": "2810617217@qq.com",
+    "url": "https://github.com/qiuhai182/encoding-switcher/issues"
   },
+  "homepage": "https://github.com/qiuhai182/encoding-switcher#readme",
   "engines": {
     "vscode": "^1.75.0"
   },
   "categories": [
-    "Other"
+    "Other",
+    "Programming Languages"
   ],
+  "galleryBanner": {
+    "color": "#1E3A8A",
+    "theme": "dark"
+  },
   "activationEvents": [
     "onStartupFinished"
   ],
   "main": "./dist/extension.js",
+  "icon": "icon.png",
   "contributes": {
     "commands": [
       {
