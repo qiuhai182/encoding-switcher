@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as iconv from "iconv-lite";
 import { detectEncoding, isUtf8 } from "./encoding";
+import { repairEncodedBytes, migrateEncodingBytes, isMojibakeText, containsCJK, RepairResult } from "./repair";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -87,6 +88,27 @@ function isApplyKernelGuess(): boolean {
   return vscode.workspace
     .getConfiguration("encoding-guard")
     .get<boolean>("applyKernelGuess", false);
+}
+
+// 插件设置：检测到可逆编码损坏时自动修复文件字节（默认开启）
+function isAutoRepairBytes(): boolean {
+  return vscode.workspace
+    .getConfiguration("encoding-guard")
+    .get<boolean>("autoRepairBytes", true);
+}
+
+// 插件设置：修复前是否留 .bak 临时备份（成功后自动删除，默认开启）
+function isRepairBackup(): boolean {
+  return vscode.workspace
+    .getConfiguration("encoding-guard")
+    .get<boolean>("repairBackup", true);
+}
+
+// 插件设置：自动修复的文件大小上限（字节，默认 5MB，超过只告警）
+function maxRepairBytes(): number {
+  return vscode.workspace
+    .getConfiguration("encoding-guard")
+    .get<number>("maxRepairBytes", 5 * 1024 * 1024);
 }
 
 // 可选功能：把候选编码写入内核 files.candidateGuessEncodings（默认关闭）。
@@ -216,7 +238,7 @@ const VIEW_SCHEME = "encoding-view";
 
 // 正确编码可读写编辑器：以指定编码解码/编码读写原文件，
 // 让“内核猜错编码”的文件拥有可编辑、可保存的正常编辑器（等效于按编码重开）。
-// 编辑器文本 ⇄ 原文件字节 的桥接规则：
+// 编辑器文本 ? 原文件字节 的桥接规则：
 //   读：原文件字节 --指定编码解码--> 正确文本 --UTF-8--> 编辑器
 //   存：编辑器文本 --UTF-8 解码--> 正确文本 --指定编码编码--> 写回原文件
 class EncodingViewProvider implements vscode.FileSystemProvider {
@@ -567,8 +589,12 @@ async function convertTo(targetEnc: string, targetLabel: string): Promise<void> 
     return;
   }
 
-  // 转换成功后记录新指纹，避免自动检测重复干预
+  // 转换成功后记录新指纹，避免自动检测重复干预；
+  // 同步监督状态，防止 watcher 把用户主动转换误判为外部编码损坏
   autoDone.set(doc.uri.toString(), diskFingerprint(doc.uri));
+  watcherDone.set(doc.uri.toString(), diskFingerprint(doc.uri));
+  repairStates.delete(doc.uri.toString());
+  lastEnc.set(doc.uri.toString(), targetEnc);
 
   // 等待文件监听处理完外部写入，再关闭重开触发重新解码
   await sleep(400);
@@ -872,20 +898,228 @@ function warnCorrupted(uri: vscode.Uri, hint?: string): void {
     });
 }
 
-// 统计解码文本中的替换字符数量（解码不可逆损坏的典型特征）
-function countReplacementChars(text: string): number {
-  let n = 0;
-  let i = text.indexOf("\ufffd");
-  while (i >= 0) {
-    n++;
-    i = text.indexOf("\ufffd", i + 1);
+// 解码并要求零替换字符（全文一致性校验用）
+function decodeWith(encoding: string, bytes: Buffer): string | null {
+  try {
+    const text = iconv.decode(bytes, encoding);
+    return text.includes("\ufffd") ? null : text;
+  } catch {
+    return null;
   }
-  return n;
 }
 
-// 是否包含中日韩字符
-function containsCJK(text: string): boolean {
-  return /[\u3400-\u4dbf\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af]/.test(text);
+// ===== 字节级自动修复：静默窗口 + 备份 + 原子替换 + 回写对抗 =====
+//
+// 并发约束（AI 可能在持续增删）：
+// 1. 绝不与 AI 同时写：只有文件静默（指纹 2 秒不变）才动手，避免交错损坏
+// 2. 动手瞬间重读校验：磁盘字节与检测时不一致（AI 刚又写了）立即放弃重新排队
+// 3. 原子替换：写临时文件后 rename 覆盖（同卷 rename 原子，AI 不会读到半截文件）
+// 4. 回写对抗：AI 用它内存里的旧快照把乱码再写回时（指纹=修复前乱码）自动再修，
+//    上限 3 次，超限告警提示让 AI 重新读取文件 —— 文件系统层无法阻止 AI 写旧内容，
+//    这是无锁可用的现实约束下能做到的最强保护
+
+// 修复状态表：uri → 修复指纹与对抗计数
+interface RepairState {
+  badFp: string; // 修复前（乱码）指纹
+  goodFp: string; // 修复后（正确）指纹
+  count: number; // 已修复次数（回写对抗用）
+}
+const repairStates = new Map<string, RepairState>();
+
+// 修复互斥：同一文件的修复不并发（静默窗口期间 watcher 可能再触发）
+const repairing = new Set<string>();
+
+// 执行修复：前置校验 → 备份 → 原子写 → 状态登记 → 通知
+// 返回 false 表示被并发/静默校验拦下（交由后续 watcher 事件重试）
+async function executeRepair(
+  uri: vscode.Uri,
+  detectedBytes: Buffer,
+  result: RepairResult
+): Promise<boolean> {
+  const key = uri.toString();
+  const name = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
+  const ext = fileExt(uri.fsPath);
+  const quiet = ext === "log"; // 日志文件通知降级：只记日志不弹窗
+
+  // 静默窗口：指纹 2 秒不变才动手，保证 AI 此刻没有在写
+  const fp1 = diskFingerprint(uri);
+  await sleep(2000);
+  const fp2 = diskFingerprint(uri);
+  if (fp1 !== fp2) {
+    L(`修复放弃（文件仍在变化，等待下次静默）：${uri.fsPath}`);
+    watcherDone.delete(key); // 清除拦截记录，重排队的检查才能继续
+    scheduleWatchCheck(uri); // 重新进入防抖队列
+    return false;
+  }
+  // 动手前最后确认：磁盘字节必须与检测时一致（AI 刚又写了就放弃）
+  let current: Buffer;
+  try {
+    current = fs.readFileSync(uri.fsPath);
+  } catch {
+    return false;
+  }
+  if (!current.equals(detectedBytes)) {
+    L(`修复放弃（磁盘内容已变化，交由下次事件重新检测）：${uri.fsPath}`);
+    scheduleWatchCheck(uri);
+    return false;
+  }
+  // 用户正在编辑器里改这个文件时不动手（防止保存时覆盖修复结果）
+  const doc = findByUri(uri);
+  if (doc && doc.isDirty) {
+    L(`修复放弃（编辑器有未保存修改）：${uri.fsPath}`);
+    return false;
+  }
+
+  // 备份 + 原子替换
+  const backupPath = uri.fsPath + ".bak";
+  const tmpPath = uri.fsPath + ".encoding-guard.tmp";
+  try {
+    if (isRepairBackup()) {
+      fs.writeFileSync(backupPath, detectedBytes);
+    }
+    fs.writeFileSync(tmpPath, result.bytes);
+    fs.renameSync(tmpPath, uri.fsPath);
+  } catch (e) {
+    L(`修复写盘失败: ${String(e)}`);
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      // 忽略
+    }
+    try {
+      fs.unlinkSync(backupPath);
+    } catch {
+      // 忽略
+    }
+    warnCorrupted(uri);
+    return true;
+  }
+  // 修复成功：删除备份，登记状态
+  try {
+    fs.unlinkSync(backupPath);
+  } catch {
+    // 忽略
+  }
+  const goodFp = diskFingerprint(uri);
+  const prev = repairStates.get(key);
+  repairStates.set(key, {
+    badFp: fp2,
+    goodFp,
+    count: (prev?.count ?? 0) + 1,
+  });
+  lastEnc.set(key, result.encoding);
+  watcherDone.set(key, goodFp);
+  encodingView?.refresh(uri.fsPath);
+  const kindLabel =
+    result.kind === "mojibake"
+      ? "双重转码"
+      : result.kind === "mixed"
+        ? "混合编码"
+        : "编码迁移回滚";
+  L(
+    `已自动修复：${uri.fsPath}（${kindLabel} → ${result.encoding}，内容与行数未变）`
+  );
+  const msg =
+    result.kind === "migrate"
+      ? `${name} 的文件编码被外部程序（可能是 AI）整体改写，已自动转回 ` +
+        `${result.encoding.toUpperCase()}，内容与行数未变`
+      : `${name} 的编码已被外部程序（可能是 AI）写坏，已自动修复还原为 ` +
+        `${result.encoding.toUpperCase()}，内容与行数未变（${kindLabel}修复）`;
+  if (quiet) {
+    L(msg);
+  } else {
+    void vscode.window.showInformationMessage(msg, "打开日志").then((c) => {
+      if (c === "打开日志") {
+        log.show();
+      }
+    });
+  }
+  return true;
+}
+
+// 检测并修复：全文分析 → 可逆修复；不可逆/不安全 → 告警
+async function tryRepairCorrupted(uri: vscode.Uri, full: Buffer): Promise<void> {
+  const key = uri.toString();
+  if (repairing.has(key)) {
+    // 同一文件修复进行中，不并发；重排队等待下一次检查
+    scheduleWatchCheck(uri);
+    return;
+  }
+  const ext = fileExt(uri.fsPath);
+  if (!isAutoRepairBytes()) {
+    const name = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
+    L(`疑似编码损坏（自动修复已关闭）：${uri.fsPath}`);
+    if (ext !== "log") {
+      void vscode.window
+        .showWarningMessage(
+          `${name} 疑似被以错误编码写入。可在设置开启 encoding-guard.autoRepairBytes 自动修复，或用版本管理回退`,
+          "打开日志"
+        )
+        .then((c) => {
+          if (c === "打开日志") {
+            log.show();
+          }
+        });
+    }
+    return;
+  }
+  repairing.add(key);
+  try {
+    const result = repairEncodedBytes(full, getDetectionEncodings());
+    if (!result) {
+      // 不可逆损坏或无法安全切分，只能告警（日志文件降级为只记日志）
+      L(`无法安全修复（不可逆损坏或行内混合），放弃自动修复：${uri.fsPath}`);
+      if (ext !== "log") {
+        warnCorrupted(uri);
+      }
+      return;
+    }
+    await executeRepair(uri, full, result);
+  } finally {
+    repairing.delete(key);
+  }
+}
+
+// 编码迁移回滚执行：内容无损但编码被整体改写，转回 watcher 记录的上次编码
+async function tryRepairMigrated(
+  uri: vscode.Uri,
+  full: Buffer,
+  converted: Buffer,
+  targetEnc: string
+): Promise<void> {
+  const key = uri.toString();
+  if (repairing.has(key)) {
+    scheduleWatchCheck(uri); // 修复进行中，重排队
+    return;
+  }
+  const ext = fileExt(uri.fsPath);
+  if (!isAutoRepairBytes()) {
+    const name = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
+    L(`检测到文件编码被整体改写（自动回滚已关闭）：${uri.fsPath}`);
+    if (ext !== "log") {
+      void vscode.window
+        .showWarningMessage(
+          `${name} 的文件编码被外部程序整体改写（内容完好）。可在设置开启 encoding-guard.autoRepairBytes 自动转回原编码`,
+          "打开日志"
+        )
+        .then((c) => {
+          if (c === "打开日志") {
+            log.show();
+          }
+        });
+    }
+    return;
+  }
+  repairing.add(key);
+  try {
+    await executeRepair(uri, full, {
+      bytes: converted,
+      encoding: targetEnc,
+      kind: "migrate",
+    });
+  } finally {
+    repairing.delete(key);
+  }
 }
 
 // watcher 事件防抖合并：短时间大量文件变化（构建/安装依赖）只批量处理一次
@@ -909,6 +1143,45 @@ function scheduleWatchCheck(uri: vscode.Uri): void {
 async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
   const key = uri.toString();
   let fp = diskFingerprint(uri);
+
+  // 回写对抗：修复后的乱码又被写回（指纹=修复前 badFp）时，
+  // 无视检查记录强制重检，再次走修复流程（次数上限在下方判断）
+  const rs = repairStates.get(key);
+  if (rs) {
+    if (fp === rs.goodFp) {
+      watcherDone.set(key, fp);
+      return; // 修复写盘自身触发的事件
+    }
+    if (fp === rs.badFp) {
+      if (rs.count >= 3) {
+        // 已自动修复 3 次仍被写回旧乱码：AI 在用它内存里的旧快照覆盖，
+        // 插件无法阻止其写入（文件系统无锁可用），停止对抗并明确告知
+        const name = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
+        L(`回写对抗达上限（已修复 ${rs.count} 次），停止自动修复：${uri.fsPath}`);
+        repairStates.delete(key);
+        watcherDone.set(key, fp);
+        void vscode.window
+          .showWarningMessage(
+            `${name} 的编码损坏已被自动修复 ${rs.count} 次，但又被外部程序（可能是 AI）用旧内容覆盖。` +
+              `请让 AI 重新读取该文件后再继续修改，或先暂停 AI 任务`,
+            "打开日志"
+          )
+          .then((c) => {
+            if (c === "打开日志") {
+              log.show();
+            }
+          });
+        return;
+      }
+      L(
+        `修复后的乱码又被写回（第 ${rs.count + 1} 次修复，AI 可能在用旧内容覆盖）：${uri.fsPath}`
+      );
+      // 继续走下方检测修复流程（不 return，也不更新 watcherDone）
+    } else {
+      repairStates.delete(key); // 内容既非修复结果也非旧乱码 → 状态失效
+    }
+  }
+
   if (watcherDone.get(key) === fp) {
     return; // 该文件该状态已检查过
   }
@@ -948,37 +1221,95 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
     }
     return;
   }
-  watcherDone.set(key, fp);
 
-  if (!isUtfFamily(enc)) {
-    return; // 正常的非 UTF 系文件，显示纠正由打开事件负责
+  // 超过修复大小上限：不做全文分析，仅保留头部告警
+  let size = 0;
+  try {
+    size = fs.statSync(uri.fsPath).size;
+  } catch {
+    return;
   }
-  // UTF-8 文件：识别双重转码特征（相对首个非 UTF 候选编码）后只告警提示手动还原
-  const headText = iconv.decode(head, "utf-8");
-  const firstAlt = candidates[0];
-  if (
-    firstAlt &&
-    containsCJK(headText) &&
-    !headText.includes("\ufffd") &&
-    isUtf8(iconv.encode(headText, firstAlt))
-  ) {
-    // 双重转码（UTF-8 被该编码误读后又以 UTF-8 写盘）：转回该编码保存即可无损还原
-    if (ext === "log") {
-      L(`疑似双重转码乱码：${uri.fsPath}`);
-    } else {
-      warnCorrupted(
-        uri,
-        `疑似双重转码乱码，可用标题栏「选择编码保存」→ ${firstAlt.toUpperCase()} 手动还原，或用版本管理回退`
-      );
+  if (size > maxRepairBytes()) {
+    watcherDone.set(key, fp);
+    if (isUtfFamily(enc)) {
+      const headText = iconv.decode(head, "utf-8");
+      if (isMojibakeText(headText) && ext !== "log") {
+        warnCorrupted(
+          uri,
+          `疑似双重转码乱码（文件超过自动修复大小上限），可用版本管理回退`
+        );
+      }
     }
     return;
   }
-  if (countReplacementChars(headText) >= 3) {
-    // 日志文件同理降级：只记日志不弹窗
-    if (ext === "log") {
-      L(`文本含替换字符（疑似损坏）：${uri.fsPath}`);
+
+  // 全文读取做一致性校验（头部合法 ≠ 全文合法，AI 可能只改写/追加了部分内容）
+  let full: Buffer;
+  try {
+    full = fs.readFileSync(uri.fsPath);
+  } catch {
+    return;
+  }
+  if (full.length === 0) {
+    watcherDone.set(key, fp);
+    return;
+  }
+  fp = diskFingerprint(uri);
+  watcherDone.set(key, fp);
+
+  if (isUtfFamily(enc)) {
+    // UTF-8 文件三种情况：
+    // 1) 全文不是合法 UTF-8 → 混入了非 UTF-8 字节（AI 用 GBK 等写入）→ 混合修复
+    // 2) 全文合法但文本几乎全是 Latin 扩展字符 → 双重转码 mojibake → 转码还原
+    // 3) 全文合法且内容正确（含中文）→ 但上次记录是非 UTF 族编码 →
+    //    疑似 AI 把原 GBK 等文件整体按 UTF-8 重写 → 编码迁移回滚
+    const body =
+      full.length >= 3 &&
+      full[0] === 0xef &&
+      full[1] === 0xbb &&
+      full[2] === 0xbf
+        ? full.subarray(3)
+        : full;
+    if (!isUtf8(body) || isMojibakeText(iconv.decode(head, "utf-8"))) {
+      await tryRepairCorrupted(uri, full);
+      return;
+    }
+    // 编码迁移回滚：上次是非 UTF 族、这次变成 UTF-8 且内容含中文
+    if (
+      prev &&
+      prev !== "unknown" &&
+      !isUtfFamily(prev) &&
+      containsCJK(iconv.decode(body, "utf-8"))
+    ) {
+      const converted = migrateEncodingBytes(full, enc, prev);
+      if (converted) {
+        await tryRepairMigrated(uri, full, converted, prev);
+      } else {
+        L(`疑似编码迁移但无法无损转回 ${prev}（含不可表达字符），放弃：${uri.fsPath}`);
+      }
+    }
+    return;
+  }
+
+  // 非 UTF 系（如 GBK）两种情况：
+  // 1) 全文按该编码解码有损 → 混入了其他编码的字节（AI 写入）→ 混合修复
+  // 2) 全文无损且内容正确 → 但上次记录是 UTF 族编码 →
+  //    疑似 AI 把原 UTF-8 文件整体按当前编码重写 → 编码迁移回滚
+  if (decodeWith(enc, full) === null) {
+    await tryRepairCorrupted(uri, full);
+    return;
+  }
+  if (
+    prev &&
+    prev !== "unknown" &&
+    isUtfFamily(prev) &&
+    containsCJK(decodeWith(enc, full) ?? "")
+  ) {
+    const converted = migrateEncodingBytes(full, enc, "utf8");
+    if (converted) {
+      await tryRepairMigrated(uri, full, converted, "utf8");
     } else {
-      warnCorrupted(uri); // 不可逆损坏（含替换字符），只能告警
+      L(`疑似编码迁移但无法无损转回 utf8（含不可表达字符），放弃：${uri.fsPath}`);
     }
   }
 }
@@ -1112,6 +1443,7 @@ export function activate(context: vscode.ExtensionContext) {
     const key = uri.toString();
     watcherDone.delete(key);
     lastEnc.delete(key);
+    repairStates.delete(key);
   });
   context.subscriptions.push(watcher);
 

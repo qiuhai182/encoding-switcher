@@ -2,7 +2,7 @@
   "name": "encoding-guard",
   "displayName": "编码自动切换器 (GBK/GB18030/UTF-8)",
   "description": "自动检测文件编码并以正确编码打开，防止中文乱码；支持 UTF-8 与 GBK/GB18030 一键互相切换",
-  "version": "0.7.0",
+  "version": "0.8.1",
   "license": "MIT",
   "keywords": [
     "encoding",
@@ -84,6 +84,21 @@
             "gb18030"
           ],
           "markdownDescription": "开启 `applyKernelGuess` 后写入内核 `files.candidateGuessEncodings` 的候选编码。注意：候选中不要包含某编码的子集（如 gbk 之外再放 gb2312），子集编解码会损坏扩展字符"
+        },
+        "encoding-guard.autoRepairBytes": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "检测到**可逆**编码损坏时自动修复文件字节（双重转码还原 / 混合编码分段转码）：纯字节转码，内容与行数不变，修复前留临时备份。不可逆损坏（字节已丢失的乱码）无法修复，仍只告警"
+        },
+        "encoding-guard.repairBackup": {
+          "type": "boolean",
+          "default": true,
+          "markdownDescription": "自动修复前是否在原文件旁写 `.bak` 临时备份（修复成功后自动删除）"
+        },
+        "encoding-guard.maxRepairBytes": {
+          "type": "number",
+          "default": 5242880,
+          "markdownDescription": "自动修复的文件大小上限（字节），超过只告警不修复，避免大文件全文分析卡顿"
         }
       }
     },
