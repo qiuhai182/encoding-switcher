@@ -2,7 +2,7 @@ import * as vscode from "vscode";
 import * as fs from "fs";
 import * as iconv from "iconv-lite";
 import { detectEncoding, isUtf8 } from "./encoding";
-import { repairEncodedBytes, migrateEncodingBytes, isMojibakeText, containsCJK, RepairResult } from "./repair";
+import { repairEncodedBytes, migrateEncodingBytes, isReversibleMojibakeText, hasStrongCJK, RepairResult } from "./repair";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -1233,7 +1233,7 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
     watcherDone.set(key, fp);
     if (isUtfFamily(enc)) {
       const headText = iconv.decode(head, "utf-8");
-      if (isMojibakeText(headText) && ext !== "log") {
+      if (isReversibleMojibakeText(headText) && ext !== "log") {
         warnCorrupted(
           uri,
           `疑似双重转码乱码（文件超过自动修复大小上限），可用版本管理回退`
@@ -1270,16 +1270,17 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
       full[2] === 0xbf
         ? full.subarray(3)
         : full;
-    if (!isUtf8(body) || isMojibakeText(iconv.decode(head, "utf-8"))) {
+    if (!isUtf8(body) || isReversibleMojibakeText(iconv.decode(head, "utf-8"))) {
       await tryRepairCorrupted(uri, full);
       return;
     }
-    // 编码迁移回滚：上次是非 UTF 族、这次变成 UTF-8 且内容含中文
+    // 编码迁移回滚：上次是非 UTF 族、这次变成 UTF-8 且内容含成词中文
+    // （强 CJK 门槛：零星对撞出的汉字不支持一次主动改写文件的回滚）
     if (
       prev &&
       prev !== "unknown" &&
       !isUtfFamily(prev) &&
-      containsCJK(iconv.decode(body, "utf-8"))
+      hasStrongCJK(iconv.decode(body, "utf-8"))
     ) {
       const converted = migrateEncodingBytes(full, enc, prev);
       if (converted) {
@@ -1303,7 +1304,7 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
     prev &&
     prev !== "unknown" &&
     isUtfFamily(prev) &&
-    containsCJK(decodeWith(enc, full) ?? "")
+    hasStrongCJK(decodeWith(enc, full) ?? "")
   ) {
     const converted = migrateEncodingBytes(full, enc, "utf8");
     if (converted) {

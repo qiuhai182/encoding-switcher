@@ -46,7 +46,7 @@ function bufEq(a, b) {
 }
 
 async function main() {
-  const { migrateEncodingBytes, repairEncodedBytes, isMojibakeText } =
+  const { migrateEncodingBytes, repairEncodedBytes, isMojibakeText, isReversibleMojibakeText, hasStrongCJK } =
     await loadRepair();
   const BOM = Buffer.from([0xef, 0xbb, 0xbf]);
 
@@ -175,6 +175,56 @@ async function main() {
   check(
     "isMojibakeText：latin1 路径 mojibake 判定 true",
     isMojibakeText(mojibake.toString("utf8")) === true
+  );
+
+  console.log("== 欧洲语言误判回归（darkreader ro locale 场景）==");
+
+  // 场景：干净的罗马尼亚语 locale JSON（ă/î/â ≤0xFF，ș/ț >0xFF），几乎全 Latin。
+  // 曾被误判为 GBK 双重转码：latin1 逆向时变音字母被静默替换成 '?'，
+  // 生成 7267 字节损坏版，再被 GBK 对撞出的 2 个孤立汉字"验证"通过。
+  const roText =
+    JSON.stringify(
+      {
+        extension_description: {
+          message:
+            "Tem\u0103 \u00eentunecat\u0103 pentru orice site. Ai grij\u0103 de ochii t\u0103i, " +
+            "folose\u0219te aceast\u0103 extensie pentru modul \u00eenchis \u0219i protejeaz\u0103-te vederea.",
+        },
+        locale_name: { message: "Rom\u00e2n\u0103" },
+        schema_version: 1,
+      },
+      null,
+      4
+    ) + "\n";
+  const roBytes = Buffer.from(roText, "utf8");
+  check(
+    "前置确认：罗马尼亚语文本被 isMojibakeText 判为 true（复现误判前提）",
+    isMojibakeText(roText) === true
+  );
+  check(
+    "干净罗马尼亚语文件不触发任何修复（返回 null）",
+    repairEncodedBytes(roBytes, ["gbk", "gb18030"]) === null
+  );
+  check(
+    "isReversibleMojibakeText：罗马尼亚语文本判定 false（逆向出现 '?'）",
+    isReversibleMojibakeText(roText) === false
+  );
+  check("hasStrongCJK：罗马尼亚语文本判定 false", hasStrongCJK(roText) === false);
+
+  // 法语（é/è/ç 全部在 latin1 内，可逆），保护来自强 CJK 门槛
+  const frText =
+    "R\u00e9sum\u00e9 : v\u00e9rifi\u00e9 \u00e0 partir d'une cr\u00e9ation d\u00e9j\u00e0 termin\u00e9e. " +
+    "D\u00e9\u00e7u, tr\u00e8s d\u00e9\u00e7u par cette r\u00e9p\u00e9tition.\n";
+  check(
+    "干净法语文本不触发任何修复（返回 null）",
+    repairEncodedBytes(Buffer.from(frText, "utf8"), ["gbk", "gb18030"]) === null
+  );
+
+  check("hasStrongCJK：真实中文词组判定 true", hasStrongCJK("中文内容修复测试") === true);
+  check("hasStrongCJK：零星单个汉字判定 false", hasStrongCJK("a中b文c") === false);
+  check(
+    "isReversibleMojibakeText：latin1 双重转码判定 true",
+    isReversibleMojibakeText(mojibake.toString("utf8")) === true
   );
 
   console.log("== 项目文件编码巡检 ==");

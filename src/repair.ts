@@ -48,6 +48,30 @@ export function containsCJK(text: string): boolean {
   return /[\u3400-\u4dbf\u4e00-\u9fff]/.test(text);
 }
 
+// 强 CJK 判定：必须出现"成词"的表意文字才可信。
+// 背景：罗马尼亚语/法语等欧洲语言文件经 GBK 解码时，变音字母与相邻字节
+// 会随机对撞出零星 CJK 字符（如 ro locale 全文恰好对撞出 2 个），
+// 仅凭 containsCJK（1 个即可）不足以支撑一次主动改写文件的修复，
+// 曾导致把干净的欧洲语言 UTF-8 文件误判为 GBK 双重转码并"修复"损坏。
+// 门槛：CJK 字符 ≥3 且 相邻 CJK 对 ≥2 —— 真实中文词组（≥3 字词）
+// 必然满足；随机对撞几乎不可能产生连续 CJK。
+export function hasStrongCJK(text: string): boolean {
+  let cjk = 0;
+  let pairs = 0;
+  let prevCjk = false;
+  for (const ch of text) {
+    const isCjk = /[\u3400-\u4dbf\u4e00-\u9fff]/.test(ch);
+    if (isCjk) {
+      cjk++;
+      if (prevCjk) {
+        pairs++;
+      }
+    }
+    prevCjk = isCjk;
+  }
+  return cjk >= 3 && pairs >= 2;
+}
+
 // cp1252 在 0x80~0x9F 区间映射出的特殊字符（€???… 等）
 const CP1252_SPECIAL = /^[\u20ac\u201a\u0192\u201e\u2026\u2020\u2021\u02c6\u2030\u0160\u2039\u0152\u017d\u2018\u2019\u201c\u201d\u2022\u2013\u2014\u02dc\u2122\u0161\u203a\u0153\u017e\u0178]$/;
 
@@ -81,6 +105,29 @@ export function isMojibakeText(text: string): boolean {
   }
   // 至少 2 个扩展 Latin 字符（纯 ASCII 无转码意义），且非 Latin 占比极低
   return ext >= 2 && other / (latin + other) < 0.05;
+}
+
+// 可逆 mojibake 判定：文本像双重转码，且能经 latin1/cp1252 逆向无损还原。
+// 用于修复/告警触发前的把关：正常的欧洲语言文本（罗马尼亚语 ă/ș/ț、
+// 波兰语 ł 等latin1 不可表达的字符）逆向时会被替换成 '?'，回读不一致，
+// 据此把它们从 mojibake 候选里排除，防止把干净文件"修复"成损坏。
+// 尾部单个 U+FFFD 视为头部截断伪影（64KB 头部切断多字节序列），剔除后验证。
+export function isReversibleMojibakeText(text: string): boolean {
+  if (!isMojibakeText(text)) {
+    return false;
+  }
+  const t = text.endsWith("\ufffd") ? text.slice(0, -1) : text;
+  for (const revEnc of ["latin1", "cp1252"]) {
+    try {
+      const orig = iconv.encode(t, revEnc);
+      if (iconv.decode(orig, revEnc) === t) {
+        return true;
+      }
+    } catch {
+      // 忽略
+    }
+  }
+  return false;
 }
 
 // 模式一：双重转码修复（可逆）
@@ -125,27 +172,33 @@ function tryFixMojibake(
     } catch {
       continue;
     }
+    // 逆向编码无损校验：latin1/cp1252 表达不了的字符（罗马尼亚语 ă/ș/ț、
+    // 波兰语 ł、越南语 ệ 等）会被 iconv 静默替换成 '?'（0x3F）。
+    // 真 mojibake 的逆向还原是逐字节零替换的；出现 '?' 即说明这是
+    // 正常的欧洲语言文本而非转码损坏，绝不能"修复"（会把字符真弄丢）。
+    // 校验方式：逆向字节按 revEnc 解回必须与原文一致。
+    let back: string | null;
+    try {
+      const dec = iconv.decode(orig, revEnc);
+      back = dec.includes("\ufffd") ? null : dec;
+    } catch {
+      back = null;
+    }
+    if (back !== text) {
+      continue;
+    }
     if (countNewlines(orig) !== nlCount) {
       continue; // 行数兜底（数学上不会发生）
     }
-    // 用候选编码验证还原出的字节：无损解码且含中文内容
+    // 用候选编码验证还原出的字节：无损解码且含成词中文内容
+    // （强 CJK 门槛：零星对撞出的 1~2 个 CJK 字符不可信）
     for (const cand of candidates) {
       const dec = decodeWith(cand, orig);
       if (dec === null) {
         continue;
       }
-      let cjk = 0;
-      let idx = -1;
-      for (const ch of dec) {
-        if (/[\u3400-\u4dbf\u4e00-\u9fff]/.test(ch)) {
-          cjk++;
-          if (cjk >= 2) {
-            break;
-          }
-        }
-      }
-      if (cjk < 2) {
-        continue; // 还原后必须出现中文内容，否则转码无意义
+      if (!hasStrongCJK(dec)) {
+        continue; // 还原后必须出现中文词组，否则转码无意义
       }
       return { bytes: orig, encoding: cand, kind: "mojibake" };
     }
