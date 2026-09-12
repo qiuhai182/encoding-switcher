@@ -299,7 +299,17 @@ class EncodingViewProvider implements vscode.FileSystemProvider {
         `已阻止一次乱码保存：文件实际编码已变为 ${curEnc}（打开时为 ${openEnc}），` +
         `继续写入会导致中文损坏。请关闭本编辑器后重新打开文件`;
       L(`已阻止乱码保存：${fsPath}（${openEnc} → ${curEnc}）`);
-      void vscode.window.showWarningMessage(msg);
+      void vscode.window
+        .showWarningMessage(msg, "重新打开文件")
+        .then((c) => {
+          if (c === "重新打开文件") {
+            // 按提示重新打开真实文件（触发重新检测纠正），编码视图由用户自行关闭
+            void vscode.commands.executeCommand(
+              "vscode.open",
+              vscode.Uri.file(fsPath)
+            );
+          }
+        });
       throw vscode.FileSystemError.NoPermissions(msg);
     }
     fs.writeFileSync(fsPath, iconv.encode(text, curEnc));
@@ -882,20 +892,27 @@ function detectHeadTolerant(
   return enc;
 }
 
-function warnCorrupted(uri: vscode.Uri, hint?: string): void {
-  const name = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
-  L(`疑似编码损坏：${uri.fsPath}`);
+// 文件告警统一弹窗：点击「打开文件」直达目标文件，「打开日志」查看诊断
+function warnWithOpenFile(msg: string, uri: vscode.Uri): void {
   void vscode.window
-    .showWarningMessage(
-      hint ??
-        `${name} 疑似被以错误编码写入，中文内容可能已损坏（如需恢复请用版本管理回退）`,
-      "打开日志"
-    )
+    .showWarningMessage(msg, "打开文件", "打开日志")
     .then((choice) => {
-      if (choice === "打开日志") {
+      if (choice === "打开文件") {
+        void vscode.commands.executeCommand("vscode.open", uri);
+      } else if (choice === "打开日志") {
         log.show();
       }
     });
+}
+
+function warnCorrupted(uri: vscode.Uri, hint?: string): void {
+  const name = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
+  L(`疑似编码损坏：${uri.fsPath}`);
+  warnWithOpenFile(
+    hint ??
+      `${name} 疑似被以错误编码写入，中文内容可能已损坏（如需恢复请用版本管理回退）`,
+    uri
+  );
 }
 
 // 解码并要求零替换字符（全文一致性校验用）
@@ -1050,16 +1067,10 @@ async function tryRepairCorrupted(uri: vscode.Uri, full: Buffer): Promise<void> 
     const name = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
     L(`疑似编码损坏（自动修复已关闭）：${uri.fsPath}`);
     if (ext !== "log") {
-      void vscode.window
-        .showWarningMessage(
-          `${name} 疑似被以错误编码写入。可在设置开启 encoding-guard.autoRepairBytes 自动修复，或用版本管理回退`,
-          "打开日志"
-        )
-        .then((c) => {
-          if (c === "打开日志") {
-            log.show();
-          }
-        });
+      warnWithOpenFile(
+        `${name} 疑似被以错误编码写入。可在设置开启 encoding-guard.autoRepairBytes 自动修复，或用版本管理回退`,
+        uri
+      );
     }
     return;
   }
@@ -1097,16 +1108,10 @@ async function tryRepairMigrated(
     const name = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
     L(`检测到文件编码被整体改写（自动回滚已关闭）：${uri.fsPath}`);
     if (ext !== "log") {
-      void vscode.window
-        .showWarningMessage(
-          `${name} 的文件编码被外部程序整体改写（内容完好）。可在设置开启 encoding-guard.autoRepairBytes 自动转回原编码`,
-          "打开日志"
-        )
-        .then((c) => {
-          if (c === "打开日志") {
-            log.show();
-          }
-        });
+      warnWithOpenFile(
+        `${name} 的文件编码被外部程序整体改写（内容完好）。可在设置开启 encoding-guard.autoRepairBytes 自动转回原编码`,
+        uri
+      );
     }
     return;
   }
@@ -1160,17 +1165,11 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
         L(`回写对抗达上限（已修复 ${rs.count} 次），停止自动修复：${uri.fsPath}`);
         repairStates.delete(key);
         watcherDone.set(key, fp);
-        void vscode.window
-          .showWarningMessage(
-            `${name} 的编码损坏已被自动修复 ${rs.count} 次，但又被外部程序（可能是 AI）用旧内容覆盖。` +
-              `请让 AI 重新读取该文件后再继续修改，或先暂停 AI 任务`,
-            "打开日志"
-          )
-          .then((c) => {
-            if (c === "打开日志") {
-              log.show();
-            }
-          });
+        warnWithOpenFile(
+          `${name} 的编码损坏已被自动修复 ${rs.count} 次，但又被外部程序（可能是 AI）用旧内容覆盖。` +
+            `请让 AI 重新读取该文件后再继续修改，或先暂停 AI 任务`,
+          uri
+        );
         return;
       }
       L(
