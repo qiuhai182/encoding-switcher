@@ -600,11 +600,14 @@ async function convertTo(targetEnc: string, targetLabel: string): Promise<void> 
   }
 
   // 转换成功后记录新指纹，避免自动检测重复干预；
-  // 同步监督状态，防止 watcher 把用户主动转换误判为外部编码损坏
-  autoDone.set(doc.uri.toString(), diskFingerprint(doc.uri));
-  watcherDone.set(doc.uri.toString(), diskFingerprint(doc.uri));
+  // 同步监督状态，防止 watcher 把用户主动转换误判为外部编码损坏；
+  // 登记切换意图（共享），防止其它窗口实例把这次切换回滚（多窗口打架）
+  const fp = diskFingerprint(doc.uri);
+  autoDone.set(doc.uri.toString(), fp);
+  watcherDone.set(doc.uri.toString(), fp);
   repairStates.delete(doc.uri.toString());
-  lastEnc.set(doc.uri.toString(), targetEnc);
+  setLastEnc(doc.uri.toString(), targetEnc);
+  registerConvertIntent(doc.uri.toString(), fp, targetEnc);
 
   // 等待文件监听处理完外部写入，再关闭重开触发重新解码
   await sleep(400);
@@ -619,22 +622,17 @@ async function convertTo(targetEnc: string, targetLabel: string): Promise<void> 
     ok = false;
   }
   if (!ok) {
-    vscode.window
-      .showErrorMessage(
-        `已转换为 ${targetLabel} 并保存到磁盘，但视图未能自动刷新为新编码。请手动关闭该文件后重新打开。可到输出面板「编码切换器」查看诊断日志。`,
-        "打开日志"
-      )
-      .then((choice) => {
-        if (choice === "打开日志") {
-          log.show();
-        }
-      });
+    notifyWithOpenFile(
+      "warn",
+      `已转换为 ${targetLabel} 并保存到磁盘，但视图未能自动刷新为新编码。请手动关闭该文件后重新打开。可到输出面板「编码切换器」查看诊断日志。`,
+      doc.uri
+    );
     return;
   }
 
   // 5) 刷新按键显示（文件编码已改变）
   await updateContext();
-  vscode.window.showInformationMessage(`已切换为 ${targetLabel} 并保存`);
+  notifyWithOpenFile("info", `已切换为 ${targetLabel} 并保存`, doc.uri);
 }
 
 // 下拉选择目标编码后转换保存（编码列表由设置 encoding-guard.detectionEncodings 驱动）
@@ -852,7 +850,121 @@ const TEXT_EXTS = new Set([
 const watcherDone = new Map<string, string>();
 
 // 上次编码记录：uri → 编码标签（编码迁移仅记日志，不弹窗打扰）
-const lastEnc = new Map<string, string>();
+// 多开窗口时每个窗口是独立扩展宿主进程，内存 Map 互不可见：
+// A 窗口刚切换/修复的编码会被 B 窗口的陈旧记录当作"外部改写"回滚，
+// 两个实例互相撤销形成编码打架。因此以 context.globalState（跨窗口
+// 共享）为准，内存仅作加速缓存，读取时取时间戳更新的一方。
+interface EncRecord {
+  enc: string;
+  time: number;
+}
+const LAST_ENC_STORE_KEY = "lastEncMap";
+const lastEnc = new Map<string, string>(); // 内存缓存层
+const lastEncTime = new Map<string, number>(); // 内存记录对应的写入时间
+let sharedState: vscode.Memento | undefined;
+
+function initSharedState(memento: vscode.Memento): void {
+  sharedState = memento;
+}
+
+function getLastEnc(key: string): string | undefined {
+  const memEnc = lastEnc.get(key);
+  const memTime = lastEncTime.get(key) ?? 0;
+  const store = sharedState?.get<Record<string, EncRecord>>(LAST_ENC_STORE_KEY) ?? {};
+  const rec = store[key];
+  if (rec && rec.time > memTime) {
+    lastEnc.set(key, rec.enc); // 顺势刷新内存缓存
+    lastEncTime.set(key, rec.time);
+    return rec.enc;
+  }
+  return memEnc;
+}
+
+function setLastEnc(key: string, enc: string): void {
+  const time = Date.now();
+  lastEnc.set(key, enc);
+  lastEncTime.set(key, time);
+  const store = sharedState?.get<Record<string, EncRecord>>(LAST_ENC_STORE_KEY) ?? {};
+  store[key] = { enc, time };
+  void sharedState?.update(LAST_ENC_STORE_KEY, store);
+}
+
+function deleteLastEnc(key: string): void {
+  lastEnc.delete(key);
+  lastEncTime.delete(key);
+  const store = sharedState?.get<Record<string, EncRecord>>(LAST_ENC_STORE_KEY) ?? {};
+  if (key in store) {
+    delete store[key];
+    void sharedState?.update(LAST_ENC_STORE_KEY, store);
+  }
+}
+
+// 主动切换编码的意图登记：切换成功后记录"新编码 + 磁盘指纹"。
+// 其它窗口的 watcher 看到指纹完全一致的外部变化时，确认这是某窗口
+// 的主动切换（而非 AI 改写），接受新编码，不做迁移回滚。
+interface ConvertIntent {
+  fp: string;
+  enc: string;
+  time: number;
+}
+const INTENT_STORE_KEY = "convertIntents";
+const INTENT_TTL_MS = 5 * 60 * 1000;
+
+function registerConvertIntent(key: string, fp: string, enc: string): void {
+  const store = sharedState?.get<Record<string, ConvertIntent>>(INTENT_STORE_KEY) ?? {};
+  // 顺手清理过期登记，防止无限膨胀
+  const now = Date.now();
+  for (const k of Object.keys(store)) {
+    if (now - store[k].time > INTENT_TTL_MS) {
+      delete store[k];
+    }
+  }
+  store[key] = { fp, enc, time: now };
+  void sharedState?.update(INTENT_STORE_KEY, store);
+}
+
+function matchConvertIntent(key: string, fp: string, enc: string): boolean {
+  const store = sharedState?.get<Record<string, ConvertIntent>>(INTENT_STORE_KEY) ?? {};
+  const it = store[key];
+  if (!it || Date.now() - it.time > INTENT_TTL_MS) {
+    return false;
+  }
+  if (it.fp !== fp || it.enc !== enc) {
+    return false;
+  }
+  delete store[key]; // 一次性消费
+  void sharedState?.update(INTENT_STORE_KEY, store);
+  return true;
+}
+
+// 多实例打架熔断：10 秒内同一文件被向不同目标编码回滚（来回翻转），
+// 判定为多个窗口在争用，暂停自动回滚并告警一次。纯内存实现，
+// 不依赖跨窗口通信，是 globalState 同步延迟时的最后防线。
+const migrateHistory = new Map<string, { time: number; target: string }[]>();
+const raceWarned = new Set<string>();
+
+function noteMigrateAndCheckRace(uri: vscode.Uri, name: string, target: string): boolean {
+  const key = uri.toString();
+  const now = Date.now();
+  const list = (migrateHistory.get(key) ?? []).filter((r) => now - r.time < 15000);
+  const conflict = list.some((r) => now - r.time < 10000 && r.target !== target);
+  list.push({ time: now, target });
+  migrateHistory.set(key, list);
+  if (!conflict) {
+    return true;
+  }
+  if (!raceWarned.has(key)) {
+    raceWarned.add(key);
+    L(`检测到多个编辑器窗口在争用文件编码（来回切换），暂停自动回滚：${name}`);
+    notifyWithOpenFile(
+      "warn",
+      `检测到多个编辑器窗口在同时管理 ${name} 的编码（来回切换）。` +
+        `已暂停自动回滚，请只在其中一个窗口操作该文件的编码切换`,
+      uri
+    );
+  }
+  return false;
+}
 
 function fileExt(p: string): string {
   const i = p.lastIndexOf(".");
@@ -903,6 +1015,26 @@ function warnWithOpenFile(msg: string, uri: vscode.Uri): void {
         log.show();
       }
     });
+}
+
+// 文件提示/告警统一弹窗（信息级或警告级）：
+// 凡是涉及具体文件的弹窗都带「打开文件」按钮，一键跳到目标文件
+function notifyWithOpenFile(
+  kind: "info" | "warn",
+  msg: string,
+  uri: vscode.Uri
+): void {
+  const show =
+    kind === "info"
+      ? vscode.window.showInformationMessage.bind(vscode.window)
+      : vscode.window.showWarningMessage.bind(vscode.window);
+  void show(msg, "打开文件", "打开日志").then((choice) => {
+    if (choice === "打开文件") {
+      void vscode.commands.executeCommand("vscode.open", uri);
+    } else if (choice === "打开日志") {
+      log.show();
+    }
+  });
 }
 
 function warnCorrupted(uri: vscode.Uri, hint?: string): void {
@@ -1024,7 +1156,7 @@ async function executeRepair(
     goodFp,
     count: (prev?.count ?? 0) + 1,
   });
-  lastEnc.set(key, result.encoding);
+  setLastEnc(key, result.encoding);
   watcherDone.set(key, goodFp);
   encodingView?.refresh(uri.fsPath);
   const kindLabel =
@@ -1045,11 +1177,7 @@ async function executeRepair(
   if (quiet) {
     L(msg);
   } else {
-    void vscode.window.showInformationMessage(msg, "打开日志").then((c) => {
-      if (c === "打开日志") {
-        log.show();
-      }
-    });
+    notifyWithOpenFile("info", msg, uri);
   }
   return true;
 }
@@ -1101,6 +1229,11 @@ async function tryRepairMigrated(
   const key = uri.toString();
   if (repairing.has(key)) {
     scheduleWatchCheck(uri); // 修复进行中，重排队
+    return;
+  }
+  // 多窗口防打架：短时间内被向相反方向回滚 → 多实例争用，熔断告警
+  const name0 = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
+  if (!noteMigrateAndCheckRace(uri, name0, targetEnc)) {
     return;
   }
   const ext = fileExt(uri.fsPath);
@@ -1196,8 +1329,16 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
   }
   const candidates = getDetectionEncodings();
   const enc = detectHeadTolerant(head, candidates);
-  const prev = lastEnc.get(key);
-  lastEnc.set(key, enc);
+  // 其它窗口主动切换编码的落盘：磁盘指纹与意图登记完全一致 →
+  // 确认是某窗口的有意切换而非 AI 改写，接受新编码并同步记录
+  if (matchConvertIntent(key, fp, enc)) {
+    setLastEnc(key, enc);
+    watcherDone.set(key, fp);
+    L(`接受其它窗口的编码切换：${uri.fsPath} → ${enc}`);
+    return;
+  }
+  const prev = getLastEnc(key);
+  setLastEnc(key, enc);
   if (prev && prev !== enc) {
     L(`编码变化：${uri.fsPath} ${prev} → ${enc}`);
   }
@@ -1325,6 +1466,7 @@ function shouldWatchFile(uri: vscode.Uri): boolean {
 export function activate(context: vscode.ExtensionContext) {
   log = vscode.window.createOutputChannel("编码切换器");
   context.subscriptions.push(log);
+  initSharedState(context.globalState); // 跨窗口共享编码历史（防多实例打架）
 
   context.subscriptions.push(
     vscode.commands.registerCommand("encoding-guard.saveWithEncoding", () => {
@@ -1442,7 +1584,7 @@ export function activate(context: vscode.ExtensionContext) {
   watcher.onDidDelete((uri) => {
     const key = uri.toString();
     watcherDone.delete(key);
-    lastEnc.delete(key);
+    deleteLastEnc(key);
     repairStates.delete(key);
   });
   context.subscriptions.push(watcher);
