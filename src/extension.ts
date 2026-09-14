@@ -1,5 +1,8 @@
 import * as vscode from "vscode";
 import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
+import * as crypto from "crypto";
 import * as iconv from "iconv-lite";
 import { detectEncoding, isUtf8 } from "./encoding";
 import { repairEncodedBytes, migrateEncodingBytes, isReversibleMojibakeText, hasStrongCJK, RepairResult } from "./repair";
@@ -291,13 +294,18 @@ class EncodingViewProvider implements vscode.FileSystemProvider {
     } catch {
       // 文件可能已被删除，交给下方 writeFileSync 报错
     }
+    // 编码变化判定：
+    //   1. 跨族变化（GBK 视图遇磁盘已变 UTF-8，或反之）→ 必须阻止：
+    //      视图文本是对磁盘字节的错误解读，写回即把好文件写坏；
+    //   2. 非 UTF 族内部变化（gbk → big5 等）→ 阻止
     const encChanged =
-      !isUtfFamily(curEnc) && !isUtfFamily(openEnc) && curEnc !== openEnc;
+      isUtfFamily(curEnc) !== isUtfFamily(openEnc) ||
+      (!isUtfFamily(curEnc) && !isUtfFamily(openEnc) && curEnc !== openEnc);
     if (encChanged) {
       // 每阻止一次乱码保存，就警告一次，让用户知道有内容被拦下
       const msg =
         `已阻止一次乱码保存：文件实际编码已变为 ${curEnc}（打开时为 ${openEnc}），` +
-        `继续写入会导致中文损坏。请关闭本编辑器后重新打开文件`;
+        `本视图内容已不可信，继续写入会导致中文损坏。请关闭本视图后重新打开文件`;
       L(`已阻止乱码保存：${fsPath}（${openEnc} → ${curEnc}）`);
       void vscode.window
         .showWarningMessage(msg, "重新打开文件")
@@ -375,6 +383,62 @@ class EncodingViewProvider implements vscode.FileSystemProvider {
     const viewUri = this.opened.get(fsPath.toLowerCase());
     if (viewUri) {
       this.emitter.fire([{ type: vscode.FileChangeType.Changed, uri: viewUri }]);
+    }
+  }
+
+  // 磁盘被外部改写后同步视图：磁盘编码与视图编码不一致（如 GBK 视图
+  // 遇到磁盘已被回滚/切换为 UTF-8）时，旧视图显示的是乱码解读，继续
+  // 编辑保存会写坏文件 → 自动关闭旧视图并按磁盘真实状态重开
+  async syncWithDisk(fsPath: string): Promise<void> {
+    const viewUri = this.opened.get(fsPath.toLowerCase());
+    if (!viewUri || !this.isOpen(fsPath)) {
+      return;
+    }
+    const viewEnc = viewUri.authority;
+    let diskEnc: string;
+    try {
+      diskEnc = detectEncoding(
+        fs.readFileSync(fsPath),
+        getDetectionEncodings()
+      );
+    } catch {
+      return; // 文件暂时不可读（删除/占用），不动视图
+    }
+    if (diskEnc === "unknown") {
+      return;
+    }
+    const sameFamily =
+      isUtfFamily(viewEnc) === isUtfFamily(diskEnc) &&
+      (isUtfFamily(diskEnc) || viewEnc === diskEnc);
+    if (sameFamily) {
+      this.refresh(fsPath); // 编码未变，仅内容变化 → 常规刷新
+      return;
+    }
+    L(`磁盘编码已变为 ${diskEnc}（视图为 ${viewEnc}），关闭过时编码视图：${fsPath}`);
+    this.opened.delete(fsPath.toLowerCase());
+    try {
+      const tabs = vscode.window.tabGroups.all
+        .flatMap((g) => g.tabs)
+        .filter(
+          (t) =>
+            t.input instanceof vscode.TabInputText &&
+            (t.input as vscode.TabInputText).uri.toString() ===
+              viewUri.toString()
+        );
+      if (tabs.length) {
+        await vscode.window.tabGroups.close(tabs, true);
+      }
+    } catch {
+      // 内核裁剪 tabGroups API 时关闭不了旧标签，仅记录（保存防线仍兜底）
+    }
+    if (isUtfFamily(diskEnc)) {
+      // 磁盘已是正常 UTF 编码：直接打开真实文件（autoGuess 对合法 UTF-8 通常正确）
+      void vscode.commands.executeCommand(
+        "vscode.open",
+        vscode.Uri.file(fsPath)
+      );
+    } else {
+      await this.open(fsPath, vscodeEncodingLabel(diskEnc));
     }
   }
 
@@ -527,6 +591,34 @@ async function reopenDisplayedCorrectly(
   // 该文件的编码编辑器当前没开着才打开；已开着说明正在正确显示，无需重复
   if (!isUtfFamily(encLabel) && encodingView) {
     if (!encodingView.isOpen(uri.fsPath)) {
+      // 打开兜底视图前按磁盘最新字节重检：重开/回滚期间磁盘可能已被改回
+      // UTF 系（文件实际已正常），用旧判定开 GBK 视图只会显示乱码误导用户
+      let diskEnc = encLabel;
+      try {
+        const re = detectEncoding(
+          fs.readFileSync(uri.fsPath),
+          getDetectionEncodings()
+        );
+        if (re !== "unknown") {
+          diskEnc = re;
+        }
+      } catch {
+        // 读取失败按原判定走
+      }
+      if (isUtfFamily(diskEnc)) {
+        L(`兜底前重检：磁盘已是 ${diskEnc}，无需编码视图，直接按新编码重开：${uri.fsPath}`);
+        try {
+          markInternalReopen(uri);
+          await vscode.commands.executeCommand(
+            reopenEncodingCmd ?? "workbench.action.reopenWithEncoding",
+            uri,
+            vscodeEncodingLabel(diskEnc)
+          );
+        } catch (e) {
+          L(`兜底重开失败: ${String(e)}`);
+        }
+        return true;
+      }
       try {
         await encodingView.open(uri.fsPath, encLabel);
         void vscode.window.showInformationMessage(
@@ -1236,6 +1328,15 @@ async function tryRepairMigrated(
   if (!noteMigrateAndCheckRace(uri, name0, targetEnc)) {
     return;
   }
+  // 新文件编码归一登记有效期内（本文件刚被某平台实例归一）：接受现状不回滚，
+  // 防止其它平台实例把归一结果（如按其 files.encoding 转成的编码）再转回去
+  const claim = getFreshClaim(uri.fsPath);
+  if (claim) {
+    L(
+      `文件近期有编码归一登记（${claim.platform} → ${claim.enc}），接受现状不做迁移回滚：${uri.fsPath}`
+    );
+    return;
+  }
   const ext = fileExt(uri.fsPath);
   if (!isAutoRepairBytes()) {
     const name = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
@@ -1455,6 +1556,230 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
   }
 }
 
+// ===== AI 新建文件的初始编码归一 =====
+// AI/工具新建的文件常按系统 ANSI（GBK）落盘，与本平台 files.encoding 设置
+// （如 UTF-8）不一致，导致后续 AI 编辑/内核显示沿用错误编码。新文件落盘后
+// 自动转换为设置默认编码（无损校验，失败放弃不动文件）。
+//
+// 多平台隔离：Trae/Cursor/VSCode 可同时开同一工作区，各平台 files.encoding
+// 可能互相冲突；文件系统不记录写者身份，无法直接判断"是哪个平台的 AI 新建
+// 的"。改用抢占式处理权登记（claim）实现等效隔离——登记写入系统临时目录
+// （跨平台实例均可见），同一新文件只有先抢到登记的实例执行归一，其它平台
+// 实例看到登记就让路；归一结果登记在案（TTL 内），所有实例的编码迁移回滚
+// 接受现状，避免多平台来回转换打架。
+
+interface EncClaim {
+  platform: string;
+  time: number;
+  status: "claimed" | "done";
+  enc: string;
+}
+
+const CLAIM_TTL_MS = 60 * 1000;
+const CLAIM_DIR = path.join(os.tmpdir(), "encoding-guard-claims");
+
+function claimPath(fsPath: string): string {
+  const h = crypto
+    .createHash("sha1")
+    .update(fsPath.replace(/\\/g, "/").toLowerCase())
+    .digest("hex");
+  return path.join(CLAIM_DIR, `${h}.json`);
+}
+
+function platformId(): string {
+  return vscode.env.uriScheme || vscode.env.appName || "unknown";
+}
+
+// 读取有效期内的处理权登记；过期即视为无效
+function getFreshClaim(fsPath: string): EncClaim | null {
+  try {
+    const raw = fs.readFileSync(claimPath(fsPath), "utf8");
+    const claim = JSON.parse(raw) as EncClaim;
+    if (Date.now() - claim.time < CLAIM_TTL_MS) {
+      return claim;
+    }
+  } catch {
+    // 无登记/损坏 → 视为无
+  }
+  return null;
+}
+
+// 原子抢占处理权（flag "wx" 保证并发下只有一个实例成功）；
+// 返回 null 表示抢占成功，返回登记内容表示已有新鲜登记需让路
+function tryClaimFile(fsPath: string, enc: string): EncClaim | null {
+  const existing = getFreshClaim(fsPath);
+  if (existing) {
+    return existing;
+  }
+  const claim: EncClaim = {
+    platform: platformId(),
+    time: Date.now(),
+    status: "claimed",
+    enc,
+  };
+  try {
+    fs.mkdirSync(CLAIM_DIR, { recursive: true });
+    fs.writeFileSync(claimPath(fsPath), JSON.stringify(claim), { flag: "wx" });
+    return null;
+  } catch {
+    // wx 失败 = 并发抢占输了 → 读取对方的登记让路
+    return getFreshClaim(fsPath) ?? claim;
+  }
+}
+
+// 归一完成，登记结果（保留至 TTL 过期，供迁移回滚接受现状）
+function finishClaim(fsPath: string, enc: string): void {
+  const claim: EncClaim = {
+    platform: platformId(),
+    time: Date.now(),
+    status: "done",
+    enc,
+  };
+  try {
+    fs.mkdirSync(CLAIM_DIR, { recursive: true });
+    fs.writeFileSync(claimPath(fsPath), JSON.stringify(claim));
+  } catch {
+    // 登记失败不影响归一结果
+  }
+}
+
+// 顺手清理过期登记（低频调用，防止目录无限膨胀）
+function pruneClaims(): void {
+  try {
+    const deadline = Date.now() - CLAIM_TTL_MS * 10;
+    for (const f of fs.readdirSync(CLAIM_DIR)) {
+      const p = path.join(CLAIM_DIR, f);
+      try {
+        if (fs.statSync(p).mtimeMs < deadline) {
+          fs.unlinkSync(p);
+        }
+      } catch {
+        // 单个失败忽略
+      }
+    }
+  } catch {
+    // 目录不存在等，忽略
+  }
+}
+
+// VSCode files.encoding 设置值 → iconv-lite 编码名
+const FILES_ENC_MAP: Record<string, string> = {
+  utf8: "utf8",
+  "utf-8": "utf8",
+  utf8bom: "utf8",
+  shiftjis: "shift_jis",
+  windows1252: "cp1252",
+  windows1251: "cp1251",
+  big5hkscs: "big5-hkscs",
+};
+
+// 本平台（含工作区覆盖）的默认文件编码
+function platformDefaultEncoding(uri: vscode.Uri): string {
+  const raw =
+    vscode.workspace
+      .getConfiguration("files", uri)
+      .get<string>("encoding", "utf8") ?? "utf8";
+  const lower = raw.toLowerCase();
+  return FILES_ENC_MAP[lower] ?? lower;
+}
+
+function countNewlineBytes(b: Buffer): number {
+  let n = 0;
+  for (let i = 0; i < b.length; i++) {
+    if (b[i] === 0x0a) {
+      n++;
+    }
+  }
+  return n;
+}
+
+const normalizePending = new Set<string>();
+
+// 新文件落盘 → 按本平台 files.encoding 归一编码（无损转换，失败不动文件）
+function normalizeNewFileEncoding(uri: vscode.Uri): void {
+  const key = uri.toString();
+  if (normalizePending.has(key) || !shouldWatchFile(uri)) {
+    return;
+  }
+  if (!TEXT_EXTS.has(fileExt(uri.fsPath))) {
+    return; // 只处理文本文件，防止误改二进制
+  }
+  normalizePending.add(key);
+  try {
+    let bytes: Buffer;
+    try {
+      bytes = fs.readFileSync(uri.fsPath);
+    } catch {
+      return;
+    }
+    if (bytes.length === 0) {
+      return; // 空文件（AI 先建后写）：等后续写入事件再归一
+    }
+    let ascii = true;
+    for (let i = 0; i < bytes.length; i++) {
+      if (bytes[i] >= 0x80) {
+        ascii = false;
+        break;
+      }
+    }
+    if (ascii) {
+      return; // 纯 ASCII 在各编码下字节相同，无需处理
+    }
+    const actual = detectEncoding(bytes, getDetectionEncodings());
+    if (actual === "unknown") {
+      return; // 无法识别（半截写入/二进制特征），交给后续事件
+    }
+    const defEnc = platformDefaultEncoding(uri);
+    setLastEnc(key, actual); // 无论是否转换，先记录基线编码
+    const sameFamily =
+      isUtfFamily(actual) === isUtfFamily(defEnc) &&
+      (isUtfFamily(defEnc) || actual === defEnc);
+    if (sameFamily) {
+      return; // 已符合设置默认编码
+    }
+    // 抢占处理权：其它平台实例已登记 → 让路（由对方归一）
+    const blocker = tryClaimFile(uri.fsPath, actual);
+    if (blocker) {
+      L(
+        `新文件编码归一已由 ${blocker.platform} 实例接管（${blocker.status}），本实例让路：${uri.fsPath}`
+      );
+      return;
+    }
+    // 无损转码：实际编码解码 → 设置默认编码编码 → 回读校验 + 行数校验
+    const text = isUtfFamily(actual)
+      ? bytes.toString("utf8")
+      : iconv.decode(bytes, actual);
+    if (text.includes("\ufffd")) {
+      L(`新文件含不可解码字节，放弃编码归一：${uri.fsPath}`);
+      return;
+    }
+    const converted = isUtfFamily(defEnc)
+      ? Buffer.from(text, "utf8")
+      : iconv.encode(text, defEnc);
+    const back = isUtfFamily(defEnc)
+      ? converted.toString("utf8")
+      : iconv.decode(converted, defEnc);
+    if (back !== text || countNewlineBytes(converted) !== countNewlineBytes(bytes)) {
+      L(
+        `新文件无法无损转为 ${defEnc.toUpperCase()}（内容或行数有损），放弃归一：${uri.fsPath}`
+      );
+      return;
+    }
+    fs.writeFileSync(uri.fsPath, converted);
+    finishClaim(uri.fsPath, defEnc);
+    setLastEnc(key, defEnc);
+    const fp = diskFingerprint(uri);
+    watcherDone.set(key, fp);
+    autoDone.set(key, fp);
+    pruneClaims();
+    L(
+      `新文件编码归一：${uri.fsPath}（${actual} → ${defEnc}，跟随本平台 files.encoding 设置）`
+    );
+  } finally {
+    normalizePending.delete(key);
+  }
+}
+
 function shouldWatchFile(uri: vscode.Uri): boolean {
   if (uri.scheme !== "file") {
     return false;
@@ -1552,6 +1877,7 @@ export function activate(context: vscode.ExtensionContext) {
       // 用户真实（重新）打开：清除历史结论，重新完整检测纠正
       autoDone.delete(key);
       reopenCooldown.delete(key);
+      normalizeNewFileEncoding(doc.uri); // 打开时若是未归一的新文件，先归一
       scheduleAutoReopen(doc.uri);
     })
   );
@@ -1560,8 +1886,15 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.workspace.onDidChangeTextDocument((e) => {
       const doc = e.document;
-      if (doc.uri.scheme === "file" && !doc.isDirty) {
+      if (!doc || doc.isDirty) {
+        return;
+      }
+      if (doc.uri.scheme === "file") {
         scheduleAutoReopen(doc.uri, true);
+        void encodingView?.syncWithDisk(doc.uri.fsPath); // 视图编码落后于磁盘时自纠
+      } else if (doc.uri.scheme === VIEW_SCHEME) {
+        // 编码视图：磁盘编码已与视图不一致时，禁编辑/自纠
+        void encodingView?.syncWithDisk(doc.uri.fsPath);
       }
     })
   );
@@ -1571,14 +1904,16 @@ export function activate(context: vscode.ExtensionContext) {
   const watcher = vscode.workspace.createFileSystemWatcher("**/*");
   watcher.onDidChange((uri) => {
     if (shouldWatchFile(uri)) {
+      normalizeNewFileEncoding(uri); // 新文件（先建后写）补归一
       scheduleWatchCheck(uri);
-      encodingView?.refresh(uri.fsPath); // 已打开的只读编码视图跟随刷新
+      void encodingView?.syncWithDisk(uri.fsPath); // 视图跟随磁盘（编码变化时自动纠正）
     }
   });
   watcher.onDidCreate((uri) => {
     if (shouldWatchFile(uri)) {
+      normalizeNewFileEncoding(uri); // AI 新建文件 → 按本平台 files.encoding 归一
       scheduleWatchCheck(uri);
-      encodingView?.refresh(uri.fsPath);
+      void encodingView?.syncWithDisk(uri.fsPath);
     }
   });
   watcher.onDidDelete((uri) => {

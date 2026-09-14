@@ -2,6 +2,7 @@ src/**
 esbuild.js
 test-repair.js
 check-enc.js
+diag-ts.js
 convert_to_utf8.py
 tsconfig.json
 node_modules/**/node_modules/**
