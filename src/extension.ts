@@ -9,13 +9,51 @@ import { repairEncodedBytes, migrateEncodingBytes, isReversibleMojibakeText, has
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
-// 诊断日志（输出面板 → “编码切换器”）
+// 诊断日志（输出面板 → “编码切换器”；同时落盘保障故障可读——输出面板
+// 重启即丢，故障排查需要持久日志）
 let log: vscode.OutputChannel;
-function L(msg: string): void {
+let logFile: string | null = null;
+const LOG_MAX_BYTES = 2 * 1024 * 1024; // 单文件 2MB，超过轮转为 .old
+
+function appendLogDisk(msg: string): void {
+  if (!logFile) {
+    return;
+  }
   try {
-    log?.appendLine(`[${new Date().toLocaleTimeString()}] ${msg}`);
+    // 轮转：当前日志过大时改名保留一代，重新开始，防止无限增长
+    try {
+      const st = fs.statSync(logFile);
+      if (st.size > LOG_MAX_BYTES) {
+        fs.renameSync(logFile, `${logFile}.old`);
+      }
+    } catch {
+      // 文件不存在等，忽略
+    }
+    fs.appendFileSync(logFile, msg + "\n");
+  } catch {
+    // 磁盘日志失败不影响主流程
+  }
+}
+
+function L(msg: string): void {
+  const line = `[${new Date().toLocaleTimeString()}] ${msg}`;
+  try {
+    log?.appendLine(line);
   } catch {
     // 忽略
+  }
+  appendLogDisk(line);
+}
+
+// 打开日志文件（落盘版，可跨会话排查故障）；文件尚未生成时退回输出面板
+function openLogFile(): void {
+  if (logFile && fs.existsSync(logFile)) {
+    void vscode.commands.executeCommand(
+      "vscode.open",
+      vscode.Uri.file(logFile)
+    );
+  } else {
+    log?.show();
   }
 }
 
@@ -1166,7 +1204,7 @@ function warnWithOpenFile(msg: string, uri: vscode.Uri): void {
       if (choice === "打开文件") {
         void vscode.commands.executeCommand("vscode.open", uri);
       } else if (choice === "打开日志") {
-        log.show();
+        openLogFile();
       }
     });
 }
@@ -1186,7 +1224,7 @@ function notifyWithOpenFile(
     if (choice === "打开文件") {
       void vscode.commands.executeCommand("vscode.open", uri);
     } else if (choice === "打开日志") {
-      log.show();
+      openLogFile();
     }
   });
 }
@@ -1916,6 +1954,9 @@ function countNewlineBytes(b: Buffer): number {
 }
 
 const normalizePending = new Set<string>();
+// 归一白名单：本会话亲眼见证创建（onDidCreate）的文件才允许归一，
+// 防止把已存在的老文件按 files.encoding 强转（0.10.4 前的严重误伤）
+const witnessedNewFiles = new Set<string>();
 
 // 新文件落盘 → 按本平台 files.encoding 归一编码（无损转换，失败不动文件）
 function normalizeNewFileEncoding(uri: vscode.Uri): void {
@@ -1951,7 +1992,13 @@ function normalizeNewFileEncoding(uri: vscode.Uri): void {
     if (actual === "unknown") {
       return; // 无法识别（半截写入/二进制特征），交给后续事件
     }
-    const defEnc = platformDefaultEncoding(uri);
+    // 归一目标：内容编码声明优先（工具链按声明解码，如 XML encoding=），
+    // 无声明才跟随本平台 files.encoding
+    const declared = declaredEncoding(bytes);
+    const defEnc = declared ?? platformDefaultEncoding(uri);
+    if (declared) {
+      L(`新文件带编码声明 ${declared}，按声明归一：${uri.fsPath}`);
+    }
     setLastEnc(key, actual); // 无论是否转换，先记录基线编码
     const sameFamily =
       isUtfFamily(actual) === isUtfFamily(defEnc) &&
@@ -2013,6 +2060,15 @@ function shouldWatchFile(uri: vscode.Uri): boolean {
 export function activate(context: vscode.ExtensionContext) {
   log = vscode.window.createOutputChannel("编码切换器");
   context.subscriptions.push(log);
+  // 日志落盘：全局存储目录（随插件持久化，重装/重启不丢）
+  try {
+    const dir = context.globalStorageUri.fsPath;
+    fs.mkdirSync(dir, { recursive: true });
+    logFile = path.join(dir, "encoding-guard.log");
+  } catch {
+    logFile = null; // 目录不可用时仅用输出面板
+  }
+  L(`===== 会话启动 v${context.extension.packageJSON.version} =====`);
   initSharedState(context.globalState); // 跨窗口共享编码历史（防多实例打架）
 
   context.subscriptions.push(
@@ -2099,7 +2155,8 @@ export function activate(context: vscode.ExtensionContext) {
       // 用户真实（重新）打开：清除历史结论，重新完整检测纠正
       autoDone.delete(key);
       reopenCooldown.delete(key);
-      normalizeNewFileEncoding(doc.uri); // 打开时若是未归一的新文件，先归一
+      // 注意：打开事件不做编码归一——旧文件打开时绝不能按 files.encoding
+      // 强转（0.10.4 前曾把用户修好的 UTF-8 老文件转回 GBK）
       scheduleAutoReopen(doc.uri);
     })
   );
@@ -2126,14 +2183,19 @@ export function activate(context: vscode.ExtensionContext) {
   const watcher = vscode.workspace.createFileSystemWatcher("**/*");
   watcher.onDidChange((uri) => {
     if (shouldWatchFile(uri)) {
-      normalizeNewFileEncoding(uri); // 新文件（先建后写）补归一
+      // 仅对"本会话亲眼见证创建"的文件补归一（AI 先建空文件后写入）；
+      // 老文件的变化事件绝不归一，防止把已有文件强转成 files.encoding
+      if (witnessedNewFiles.has(uri.toString())) {
+        normalizeNewFileEncoding(uri);
+      }
       scheduleWatchCheck(uri);
       void encodingView?.syncWithDisk(uri.fsPath); // 视图跟随磁盘（编码变化时自动纠正）
     }
   });
   watcher.onDidCreate((uri) => {
     if (shouldWatchFile(uri)) {
-      normalizeNewFileEncoding(uri); // AI 新建文件 → 按本平台 files.encoding 归一
+      witnessedNewFiles.add(uri.toString()); // 见证创建：允许后续归一
+      normalizeNewFileEncoding(uri); // AI 新建文件 → 按声明/files.encoding 归一
       scheduleWatchCheck(uri);
       void encodingView?.syncWithDisk(uri.fsPath);
     }
