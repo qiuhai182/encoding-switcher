@@ -722,7 +722,37 @@ async function convertTo(targetEnc: string, targetLabel: string): Promise<void> 
     return;
   }
 
-  // 5) 刷新按键显示（文件编码已改变）
+  // 5) 确保文档模型编码标签与磁盘一致：上面的重开验证可能走"显示已正确"
+  //    的早退路径（内容匹配但 doc.encoding 仍是旧值，如内核 autoGuess 猜对
+  //    了内容），此时底部状态栏的编码显示会停留在旧编码 → 补一次指定编码
+  //    重开，强制文档模型（含状态栏标签）同步为目标编码
+  const docNow = findByUri(doc.uri);
+  if (docNow && !docNow.isDirty && reopenEncodingCmd) {
+    const encAttr = docNow.encoding.toLowerCase();
+    const attrUtf = isUtfFamily(encAttr);
+    const tgtUtf = isUtfFamily(targetEnc);
+    const labelMatches =
+      attrUtf === tgtUtf && (tgtUtf || encAttr === targetEnc.toLowerCase());
+    if (!labelMatches) {
+      try {
+        markInternalReopen(doc.uri);
+        await vscode.commands.executeCommand(
+          reopenEncodingCmd,
+          doc.uri,
+          targetLabel
+        );
+        L(
+          `文档编码标签已刷新：${filePath} → ${targetLabel}（状态栏与磁盘编码同步）`
+        );
+      } catch (e) {
+        L(
+          `编码标签刷新失败（文件已按 ${targetLabel} 保存成功，重载窗口后恢复）：${String(e)}`
+        );
+      }
+    }
+  }
+
+  // 6) 刷新按键显示（文件编码已改变）
   await updateContext();
   notifyWithOpenFile("info", `已切换为 ${targetLabel} 并保存`, doc.uri);
 }
