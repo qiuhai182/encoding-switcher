@@ -1335,9 +1335,29 @@ async function fixOpenTabEncoding(uri: vscode.Uri, targetEnc: string): Promise<v
 // 修复互斥：同一文件的修复不并发（静默窗口期间 watcher 可能再触发）
 const repairing = new Set<string>();
 
-// 执行修复：前置校验 → 备份 → 原子写 → 状态登记 → 通知
-// 返回 false 表示被并发/静默校验拦下（交由后续 watcher 事件重试）
+// 执行修复（选主版）：跨进程抢修复租约，同一文件同一时刻只有一个实例动手
 async function executeRepair(
+  uri: vscode.Uri,
+  detectedBytes: Buffer,
+  result: RepairResult
+): Promise<boolean> {
+  const lease = acquireRepairLease(uri.fsPath, result.encoding);
+  if (lease) {
+    L(
+      `修复租约已被 ${lease.platform} 实例持有（→ ${lease.enc}），本实例让路（选主落败）：${uri.fsPath}`
+    );
+    return false; // 执行者完成后磁盘即恢复，无需重试
+  }
+  try {
+    return await executeRepairInner(uri, detectedBytes, result);
+  } finally {
+    releaseRepairLease(uri.fsPath);
+  }
+}
+
+// 执行修复主体：前置校验 → 备份 → 原子写 → 状态登记 → 通知
+// 返回 false 表示被并发/静默校验拦下（交由后续 watcher 事件重试）
+async function executeRepairInner(
   uri: vscode.Uri,
   detectedBytes: Buffer,
   result: RepairResult
@@ -1901,6 +1921,65 @@ function forceClaim(fsPath: string, enc: string, status: EncClaim["status"]): vo
 // 归一完成，登记结果（保留至 TTL 过期，供迁移回滚接受现状）
 function finishClaim(fsPath: string, enc: string): void {
   forceClaim(fsPath, enc, "done");
+}
+
+// ===== 修复租约（选主机制）=====
+// 同一工作区多开实例（Trae/Cursor/VSCode）时，各实例的 watcher 都会看到
+// 同一次外部写入并独立触发修复。同向修复幂等但浪费 IO；反向修复（各实例
+// 编码历史不同）会无限打架。租约保证同一文件的修复只有一个实例执行：
+// 原子 wx 抢租约，抢到的修，其余实例让路。租约含 20s TTL 防实例中途崩溃
+// 死锁；修复完成（含放弃路径）立即释放，落败实例可在下次事件重试
+const REPAIR_LEASE_TTL_MS = 20 * 1000;
+
+function repairLeasePath(fsPath: string): string {
+  return claimPath(fsPath) + ".lease";
+}
+
+// 抢占修复租约：返回 null 表示抢到（本实例执行修复），
+// 返回租约内容表示其它实例正在修复（让路）
+function acquireRepairLease(fsPath: string, enc: string): EncClaim | null {
+  const leasePath = repairLeasePath(fsPath);
+  try {
+    const raw = fs.readFileSync(leasePath, "utf8");
+    const lease = JSON.parse(raw) as EncClaim;
+    if (Date.now() - lease.time < REPAIR_LEASE_TTL_MS) {
+      return lease; // 新鲜租约被他人持有 → 让路
+    }
+    // 过期租约（持有者可能已崩溃）→ 清除后重新抢占
+    try {
+      fs.unlinkSync(leasePath);
+    } catch {
+      // 忽略
+    }
+  } catch {
+    // 无租约 → 直接抢
+  }
+  const lease: EncClaim = {
+    platform: platformId(),
+    time: Date.now(),
+    status: "claimed",
+    enc,
+  };
+  try {
+    fs.mkdirSync(CLAIM_DIR, { recursive: true });
+    fs.writeFileSync(leasePath, JSON.stringify(lease), { flag: "wx" });
+    return null; // 抢到
+  } catch {
+    // wx 失败 = 并发抢租约输了 → 读对方租约让路
+    try {
+      return JSON.parse(fs.readFileSync(leasePath, "utf8")) as EncClaim;
+    } catch {
+      return lease; // 读不到也保守让路一轮
+    }
+  }
+}
+
+function releaseRepairLease(fsPath: string): void {
+  try {
+    fs.unlinkSync(repairLeasePath(fsPath));
+  } catch {
+    // 已释放/不存在
+  }
 }
 
 // 顺手清理过期登记（低频调用，防止目录无限膨胀）
