@@ -1549,6 +1549,34 @@ function scheduleWatchCheck(uri: vscode.Uri): void {
   }, 500);
 }
 
+// 内容自声明的编码：XML 声明 <?xml version="1.0" encoding="utf-8"?>、
+// HTML meta charset 等。声明必须是 ASCII 且位于文件头部。迁移回滚方向
+// 与声明冲突时以声明为准（工具链按声明解码，磁盘编码违背声明即为损坏）
+function declaredEncoding(head: Buffer): string | null {
+  const probe = head.subarray(0, 256);
+  for (let i = 0; i < probe.length; i++) {
+    if (probe[i] >= 0x80) {
+      return null; // 声明区含非 ASCII → 无有效声明
+    }
+  }
+  const s = probe.toString("latin1");
+  const m =
+    s.match(/encoding\s*=\s*["']([-A-Za-z0-9_.]+)["']/i) ??
+    s.match(/charset\s*=\s*["']([-A-Za-z0-9_.]+)["']/i);
+  if (!m) {
+    return null;
+  }
+  const alias: Record<string, string> = {
+    utf8: "utf8",
+    "utf-8": "utf8",
+    gb2312: "gb2312",
+    gbk: "gbk",
+    gb18030: "gb18030",
+    big5: "big5",
+  };
+  return alias[m[1].toLowerCase()] ?? null;
+}
+
 async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
   const key = uri.toString();
   let fp = diskFingerprint(uri);
@@ -1693,6 +1721,15 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
       !isUtfFamily(prev) &&
       hasStrongCJK(iconv.decode(body, "utf-8"))
     ) {
+      // 内容声明与回滚目标冲突（如 XML 声明 utf-8、历史是 GBK）→ 声明优先：
+      // 文件当前已是声明编码（自洽），"迁移"实为 AI/工具的有意转换，不回滚
+      const declared = declaredEncoding(head);
+      if (declared && isUtfFamily(declared)) {
+        L(
+          `内容声明 ${declared} 与当前一致，接受现状不做迁移回滚：${uri.fsPath}`
+        );
+        return;
+      }
       const converted = migrateEncodingBytes(full, enc, prev);
       if (converted) {
         await tryRepairMigrated(uri, full, converted, prev);
@@ -1717,11 +1754,21 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
     isUtfFamily(prev) &&
     hasStrongCJK(decodeWith(enc, full) ?? "")
   ) {
-    const converted = migrateEncodingBytes(full, enc, "utf8");
+    // 磁盘编码违背内容声明（如 XML 声明 utf-8、磁盘却是 GBK）→ 以声明为
+    // 修复目标（工具链按声明解码，声明优先于历史编码记录）；无声明或声明
+    // 即当前编码时才按历史回滚为 utf8
+    const declared = declaredEncoding(head);
+    const target = declared && !isUtfFamily(declared) ? declared : "utf8";
+    if (declared && !isUtfFamily(declared)) {
+      L(
+        `磁盘编码 ${enc} 违背内容声明 ${declared}，按声明编码修复：${uri.fsPath}`
+      );
+    }
+    const converted = migrateEncodingBytes(full, enc, target);
     if (converted) {
-      await tryRepairMigrated(uri, full, converted, "utf8");
+      await tryRepairMigrated(uri, full, converted, target);
     } else {
-      L(`疑似编码迁移但无法无损转回 utf8（含不可表达字符），放弃：${uri.fsPath}`);
+      L(`疑似编码迁移但无法无损转回 ${target}（含不可表达字符），放弃：${uri.fsPath}`);
     }
   }
 }
