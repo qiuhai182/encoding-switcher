@@ -1229,6 +1229,71 @@ interface RepairState {
 }
 const repairStates = new Map<string, RepairState>();
 
+// 迁移回滚反复对抗计数：同一文件短时间内被多次回滚（IDE 自动保存用错误
+// 编码标签反复写回 / 多实例互搏）时熔断——继续重写只会无限打架，改为
+// 纠正标签页编码（根治自动保存的写入编码）并告警
+interface MigrateState {
+  count: number;
+  time: number;
+}
+const migrateStates = new Map<string, MigrateState>();
+const MIGRATE_STRIKES = 3;
+const MIGRATE_WINDOW_MS = 3 * 60 * 1000;
+
+// 修复静默放弃计数：文件持续变化/编辑器未保存修改导致修复反复放弃时，
+// 不能一直只记日志——累计到阈值弹窗告知用户真正原因
+const repairAbandons = new Map<string, { count: number; time: number }>();
+
+function noteRepairAbandon(uri: vscode.Uri, advice: string): void {
+  const key = uri.toString();
+  const now = Date.now();
+  const st = repairAbandons.get(key);
+  if (!st || now - st.time > MIGRATE_WINDOW_MS) {
+    repairAbandons.set(key, { count: 1, time: now });
+    return;
+  }
+  st.count++;
+  st.time = now;
+  if (st.count === MIGRATE_STRIKES) {
+    repairAbandons.delete(key);
+    warnWithOpenFile(
+      `编码守护连续 ${MIGRATE_STRIKES} 次放弃修复：${advice}`,
+      uri
+    );
+  }
+}
+
+// 纠正已打开标签页的编码标签：文件实际编码与标签页编码不同族时（如文件
+// 已转回 UTF-8、标签页还是 GB2312），IDE 自动保存会按旧标签反复把编码写
+// 坏——修复字节治标，纠正标签页才治本。按目标编码强制重开（内部事件，
+// 不触发外部改写监督）
+async function fixOpenTabEncoding(uri: vscode.Uri, targetEnc: string): Promise<void> {
+  const doc = findByUri(uri);
+  if (!doc || doc.isDirty || !reopenEncodingCmd) {
+    return;
+  }
+  const encAttr = doc.encoding.toLowerCase();
+  const attrUtf = isUtfFamily(encAttr);
+  const tgtUtf = isUtfFamily(targetEnc);
+  const sameFamily =
+    attrUtf === tgtUtf && (tgtUtf || encAttr === targetEnc.toLowerCase());
+  if (sameFamily) {
+    return; // 标签页编码与实际一致，无需纠正
+  }
+  try {
+    markInternalReopen(uri);
+    await vscode.commands.executeCommand(
+      reopenEncodingCmd,
+      uri,
+      vscodeEncodingLabel(targetEnc)
+    );
+    L(`已按 ${targetEnc} 纠正标签页编码（防止自动保存继续写坏）：${uri.fsPath}`);
+  } catch (e) {
+    L(`纠正标签页编码失败（文件字节已修复，建议手动重开该文件）: ${String(e)}`);
+  }
+}
+
+
 // 修复互斥：同一文件的修复不并发（静默窗口期间 watcher 可能再触发）
 const repairing = new Set<string>();
 
@@ -1252,6 +1317,12 @@ async function executeRepair(
     L(`修复放弃（文件仍在变化，等待下次静默）：${uri.fsPath}`);
     watcherDone.delete(key); // 清除拦截记录，重排队的检查才能继续
     scheduleWatchCheck(uri); // 重新进入防抖队列
+    noteRepairAbandon(
+      uri,
+      `${name} 反复被外部程序写入（文件持续变化无法修复）。` +
+        `常见原因：IDE 用错误编码打开该文件且开启了自动保存，每次保存都把编码写坏。` +
+        `请关闭并按正确编码重新打开该文件，或暂停自动保存后再试`
+    );
     return false;
   }
   // 动手前最后确认：磁盘字节必须与检测时一致（AI 刚又写了就放弃）
@@ -1270,6 +1341,11 @@ async function executeRepair(
   const doc = findByUri(uri);
   if (doc && doc.isDirty) {
     L(`修复放弃（编辑器有未保存修改）：${uri.fsPath}`);
+    noteRepairAbandon(
+      uri,
+      `${name} 的编辑器有未保存修改，无法自动修复。` +
+        `请先保存或关闭该文件，插件会在下次外部写入时重新修复`
+    );
     return false;
   }
 
@@ -1399,6 +1475,33 @@ async function tryRepairMigrated(
     );
     return;
   }
+  // 反复对抗熔断：短时间内已被多次回滚又被写坏 → 大概率是 IDE 自动保存
+  // 按错误编码标签反复写盘。继续重写只会无限打架（外部看到"插件在乱改
+  // 编码"）——改为纠正标签页编码根治写入源头，并明确告警
+  const nowMs = Date.now();
+  const ms = migrateStates.get(key);
+  if (ms && nowMs - ms.time < MIGRATE_WINDOW_MS) {
+    ms.count++;
+    ms.time = nowMs;
+    if (ms.count >= MIGRATE_STRIKES) {
+      migrateStates.delete(key);
+      L(
+        `迁移回滚达 ${MIGRATE_STRIKES} 次仍被写回，停止重写字节，改为纠正标签页编码：${uri.fsPath}`
+      );
+      await fixOpenTabEncoding(uri, targetEnc);
+      const name1 = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
+      warnWithOpenFile(
+        `${name1} 的编码已被反复改写 ${ms.count} 次又写坏 ${MIGRATE_STRIKES} 次，` +
+          `插件已停止反复重写。最常见原因：该文件在编辑器里用错误编码打开且开启了自动保存，` +
+          `每次保存都会写坏编码。已尝试按 ${targetEnc.toUpperCase()} 纠正标签页；` +
+          `若仍反复出现，请关闭该文件标签页后重新打开`,
+        uri
+      );
+      return;
+    }
+  } else {
+    migrateStates.set(key, { count: 1, time: nowMs });
+  }
   const ext = fileExt(uri.fsPath);
   if (!isAutoRepairBytes()) {
     const name = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
@@ -1413,11 +1516,16 @@ async function tryRepairMigrated(
   }
   repairing.add(key);
   try {
-    await executeRepair(uri, full, {
+    const done = await executeRepair(uri, full, {
       bytes: converted,
       encoding: targetEnc,
       kind: "migrate",
     });
+    if (done) {
+      // 字节已转回目标编码：立即同步标签页编码，否则 IDE 自动保存仍按
+      // 旧标签（错误编码）写盘，立刻把文件再次写坏 → 无限反复
+      await fixOpenTabEncoding(uri, targetEnc);
+    }
   } finally {
     repairing.delete(key);
   }
