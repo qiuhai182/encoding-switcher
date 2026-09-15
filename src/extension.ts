@@ -685,7 +685,12 @@ async function convertTo(targetEnc: string, targetLabel: string): Promise<void> 
     return;
   }
 
-  // 3) 以目标编码写回（UTF-8 不写 BOM）
+  // 3) 以目标编码写回（UTF-8 不写 BOM）。
+  //    写盘前先落跨进程立即可见的处理权登记（临时目录文件）：其它平台/窗口
+  //    实例的 watcher 可能在本实例的 globalState 意图同步到位前就收到文件
+  //    变化事件，把这次切换误判为 AI 改写而回滚成旧编码——即"第一次转换
+  //    没生效"的根源。claim 读取无同步延迟，回滚钩子见到即让路。
+  forceClaim(filePath, targetEnc, "claimed");
   if (!writeFileWithEncoding(filePath, text, targetEnc)) {
     vscode.window.showErrorMessage(`切换为 ${targetLabel} 失败`);
     return;
@@ -752,7 +757,34 @@ async function convertTo(targetEnc: string, targetLabel: string): Promise<void> 
     }
   }
 
-  // 6) 刷新按键显示（文件编码已改变）
+  // 6) 磁盘终验：确认磁盘字节确实是目标编码。若在重开/标签刷新窗口期
+  //    被其它实例回滚成旧编码，立即重写覆盖——保证第一次转换就落盘生效，
+  //    而不是弹了成功提示、文件却还是旧编码，得手动转第二次
+  try {
+    const finalBytes = fs.readFileSync(filePath);
+    const finalEnc = detectEncoding(finalBytes, getDetectionEncodings());
+    const finUtf = isUtfFamily(finalEnc);
+    const tgtUtf = isUtfFamily(targetEnc);
+    const finalOk =
+      finUtf === tgtUtf && (tgtUtf || finalEnc === targetEnc);
+    if (!finalOk) {
+      L(
+        `终验发现文件被回滚为 ${finalEnc}（应为 ${targetEnc}），重新写入覆盖：${filePath}`
+      );
+      forceClaim(filePath, targetEnc, "claimed");
+      writeFileWithEncoding(filePath, text, targetEnc);
+    }
+    finishClaim(filePath, targetEnc);
+    // 指纹按（可能重写后的）最新磁盘状态刷新，避免自动检测重复干预
+    const fpFinal = diskFingerprint(doc.uri);
+    autoDone.set(doc.uri.toString(), fpFinal);
+    watcherDone.set(doc.uri.toString(), fpFinal);
+    setLastEnc(doc.uri.toString(), targetEnc);
+  } catch {
+    // 读取失败不阻断收尾（前面写盘已成功过）
+  }
+
+  // 7) 刷新按键显示（文件编码已改变）
   await updateContext();
   notifyWithOpenFile("info", `已切换为 ${targetLabel} 并保存`, doc.uri);
 }
@@ -1657,20 +1689,25 @@ function tryClaimFile(fsPath: string, enc: string): EncClaim | null {
   }
 }
 
-// 归一完成，登记结果（保留至 TTL 过期，供迁移回滚接受现状）
-function finishClaim(fsPath: string, enc: string): void {
+// 强制写入处理权登记（覆盖已有登记；用于本实例主动接管：手动切换编码等）
+function forceClaim(fsPath: string, enc: string, status: EncClaim["status"]): void {
   const claim: EncClaim = {
     platform: platformId(),
     time: Date.now(),
-    status: "done",
+    status,
     enc,
   };
   try {
     fs.mkdirSync(CLAIM_DIR, { recursive: true });
     fs.writeFileSync(claimPath(fsPath), JSON.stringify(claim));
   } catch {
-    // 登记失败不影响归一结果
+    // 登记失败不影响主流程
   }
+}
+
+// 归一完成，登记结果（保留至 TTL 过期，供迁移回滚接受现状）
+function finishClaim(fsPath: string, enc: string): void {
+  forceClaim(fsPath, enc, "done");
 }
 
 // 顺手清理过期登记（低频调用，防止目录无限膨胀）
