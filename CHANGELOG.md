@@ -1,5 +1,9 @@
 # 更新日志
 
+## 0.10.6
+
+- 修复：Trae 内核探测不到"指定编码重开"命令（reopenWithEncoding 系列已移除，仅有 changeEncoding）导致转换/修复后状态栏编码标签永远停在旧值，用户反复转换都"未生效"。新增统一重开入口 reopenDocWithEncoding：无内核命令时退化为「临时改 files.encoding + 暂停 autoGuessEncoding + revertFile 强制重解码，完成后恢复原设置」，转换、修复后标签纠正、迁移回滚标签纠正三处统一接入
+
 ## 0.10.5
 
 - 新增：诊断日志落盘（全局存储目录 `encoding-guard.log`，单文件 2MB 自动轮转保留一代），重启/重装后仍可排查历史故障；弹窗「打开日志」按钮改为直接打开日志文件

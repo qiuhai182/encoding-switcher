@@ -270,6 +270,54 @@ async function detectReopenEncodingCmd(): Promise<void> {
   }
 }
 
+// 指定编码重开（统一入口）：优先内核命令；Trae 内核无 reopenWithEncoding
+// 命令时（探测见 14:31:03 日志），退化为「临时改 files.encoding + 暂停
+// autoGuessEncoding + revertFile 强制重解码」，完成后恢复原设置——否则
+// 转换/修复后状态栏编码标签永远停在旧值，用户会以为转换没生效
+async function reopenDocWithEncoding(
+  uri: vscode.Uri,
+  encLabel: string
+): Promise<void> {
+  if (reopenEncodingCmd) {
+    markInternalReopen(uri);
+    await vscode.commands.executeCommand(reopenEncodingCmd, uri, encLabel);
+    return;
+  }
+  const filesCfg = vscode.workspace.getConfiguration("files", uri);
+  const hasWs = !!vscode.workspace.workspaceFolders?.length;
+  const scope = hasWs
+    ? vscode.ConfigurationTarget.Workspace
+    : vscode.ConfigurationTarget.Global;
+  const scopeKey = hasWs ? "workspaceValue" : "globalValue";
+  const encInspect = filesCfg.inspect<string>("encoding");
+  const guessInspect = filesCfg.inspect<boolean>("autoGuessEncoding");
+  const oldEnc = encInspect ? encInspect[scopeKey] : undefined;
+  const oldGuess = guessInspect ? guessInspect[scopeKey] : undefined;
+  try {
+    await filesCfg.update(
+      "encoding",
+      vscodeEncodingLabel(encLabel).toLowerCase(),
+      scope
+    );
+    await filesCfg.update("autoGuessEncoding", false, scope);
+    const doc = findByUri(uri) ?? (await vscode.workspace.openTextDocument(uri));
+    await vscode.window.showTextDocument(doc, {
+      preview: false,
+      preserveFocus: true,
+    });
+    markInternalReopen(uri);
+    await vscode.commands.executeCommand("workbench.action.files.revertFile");
+    L(`已按 ${encLabel} 重载文件（files.encoding 临时切换方案）：${uri.fsPath}`);
+  } finally {
+    try {
+      await filesCfg.update("encoding", oldEnc, scope);
+      await filesCfg.update("autoGuessEncoding", oldGuess, scope);
+    } catch {
+      // 恢复失败不阻断（值仅短暂变更，下次用户改动设置会覆盖）
+    }
+  }
+}
+
 // ===== 兜底：正确编码只读视图 =====
 // Trae SOLO 内核既猜不对编码、又没有“指定编码重开”命令时，
 // 通过自定义 scheme 提供按正确编码解码的只读视图，保证中文可读；
@@ -550,23 +598,17 @@ async function reopenDisplayedCorrectly(
     return false;
   }
 
-  // 首选：命令式指定编码重开（使用侦查到的内核命令）
-  if (reopenEncodingCmd) {
-    try {
-      markInternalReopen(uri); // 重开会重建文档模型，标记为内部事件
-      await vscode.commands.executeCommand(
-        reopenEncodingCmd,
-        uri,
-        encLabel
-      );
-      if (await displayedOK(10)) {
-        L(`命令式重开(${encLabel}，${reopenEncodingCmd})成功：${uri.fsPath}`);
-        return true;
-      }
-      L(`命令式重开(${encLabel})后显示仍不正确：${uri.fsPath}`);
-    } catch (e) {
-      L(`命令式重开异常: ${String(e)}`);
+  // 首选：指定编码重开（内核命令；无命令的 Trae 内核退化为
+  // files.encoding 临时切换 + revertFile，见 reopenDocWithEncoding）
+  try {
+    await reopenDocWithEncoding(uri, encLabel);
+    if (await displayedOK(10)) {
+      L(`指定编码重开(${encLabel})成功：${uri.fsPath}`);
+      return true;
     }
+    L(`指定编码重开(${encLabel})后显示仍不正确：${uri.fsPath}`);
+  } catch (e) {
+    L(`指定编码重开异常: ${String(e)}`);
   }
 
   // 只尝试一次：内核的猜测是确定性的（同样字节永远猜同样结果），
@@ -770,7 +812,7 @@ async function convertTo(targetEnc: string, targetLabel: string): Promise<void> 
   //    了内容），此时底部状态栏的编码显示会停留在旧编码 → 补一次指定编码
   //    重开，强制文档模型（含状态栏标签）同步为目标编码
   const docNow = findByUri(doc.uri);
-  if (docNow && !docNow.isDirty && reopenEncodingCmd) {
+  if (docNow && !docNow.isDirty) {
     const encAttr = docNow.encoding.toLowerCase();
     const attrUtf = isUtfFamily(encAttr);
     const tgtUtf = isUtfFamily(targetEnc);
@@ -778,12 +820,7 @@ async function convertTo(targetEnc: string, targetLabel: string): Promise<void> 
       attrUtf === tgtUtf && (tgtUtf || encAttr === targetEnc.toLowerCase());
     if (!labelMatches) {
       try {
-        markInternalReopen(doc.uri);
-        await vscode.commands.executeCommand(
-          reopenEncodingCmd,
-          doc.uri,
-          targetLabel
-        );
+        await reopenDocWithEncoding(doc.uri, targetLabel);
         L(
           `文档编码标签已刷新：${filePath} → ${targetLabel}（状态栏与磁盘编码同步）`
         );
@@ -1307,7 +1344,7 @@ function noteRepairAbandon(uri: vscode.Uri, advice: string): void {
 // 不触发外部改写监督）
 async function fixOpenTabEncoding(uri: vscode.Uri, targetEnc: string): Promise<void> {
   const doc = findByUri(uri);
-  if (!doc || doc.isDirty || !reopenEncodingCmd) {
+  if (!doc || doc.isDirty) {
     return;
   }
   const encAttr = doc.encoding.toLowerCase();
@@ -1319,12 +1356,7 @@ async function fixOpenTabEncoding(uri: vscode.Uri, targetEnc: string): Promise<v
     return; // 标签页编码与实际一致，无需纠正
   }
   try {
-    markInternalReopen(uri);
-    await vscode.commands.executeCommand(
-      reopenEncodingCmd,
-      uri,
-      vscodeEncodingLabel(targetEnc)
-    );
+    await reopenDocWithEncoding(uri, vscodeEncodingLabel(targetEnc));
     L(`已按 ${targetEnc} 纠正标签页编码（防止自动保存继续写坏）：${uri.fsPath}`);
   } catch (e) {
     L(`纠正标签页编码失败（文件字节已修复，建议手动重开该文件）: ${String(e)}`);
