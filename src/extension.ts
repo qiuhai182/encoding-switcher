@@ -858,6 +858,9 @@ async function convertTo(targetEnc: string, targetLabel: string): Promise<void> 
   } catch {
     // 读取失败不阻断收尾（前面写盘已成功过）
   }
+  // 跨平台登记当前编码：其它平台实例（可能历史相反）回滚前会查注册表，
+  // 与磁盘一致即接受现状——防止手动转换后与其它平台连续抢注转码
+  writeEncReg(filePath, targetEnc);
 
   // 7) 刷新按键显示（文件编码已改变）
   await updateContext();
@@ -1477,6 +1480,7 @@ async function executeRepairInner(
     count: (prev?.count ?? 0) + 1,
   });
   setLastEnc(key, result.encoding);
+  writeEncReg(uri.fsPath, result.encoding); // 跨平台登记当前编码（方向仲裁依据）
   watcherDone.set(key, goodFp);
   encodingView?.refresh(uri.fsPath);
   const kindLabel =
@@ -1811,6 +1815,17 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
       !isUtfFamily(prev) &&
       hasStrongCJK(iconv.decode(body, "utf-8"))
     ) {
+      // 跨平台注册表仲裁：登记为 UTF 族（最近某平台修复/切换成 UTF）→
+      // 与磁盘一致，接受现状并同步本地历史——否则两个平台各按自己的
+      // lastEnc 反向回滚，连续抢注转码直到熔断
+      const reg = readEncReg(uri.fsPath);
+      if (reg && isUtfFamily(reg.enc)) {
+        setLastEnc(uri.toString(), enc);
+        L(
+          `跨平台登记为 ${reg.enc}（${reg.platform}），与磁盘一致，接受现状：${uri.fsPath}`
+        );
+        return;
+      }
       // 内容声明与回滚目标冲突（如 XML 声明 utf-8、历史是 GBK）→ 声明优先：
       // 文件当前已是声明编码（自洽），"迁移"实为 AI/工具的有意转换，不回滚
       const declared = declaredEncoding(head);
@@ -1820,11 +1835,13 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
         );
         return;
       }
-      const converted = migrateEncodingBytes(full, enc, prev);
+      // 回滚目标以注册表为准（跨平台共识比本平台历史更新）；无登记才用 prev
+      const target = reg && !isUtfFamily(reg.enc) ? reg.enc : prev;
+      const converted = migrateEncodingBytes(full, enc, target);
       if (converted) {
-        await tryRepairMigrated(uri, full, converted, prev);
+        await tryRepairMigrated(uri, full, converted, target);
       } else {
-        L(`疑似编码迁移但无法无损转回 ${prev}（含不可表达字符），放弃：${uri.fsPath}`);
+        L(`疑似编码迁移但无法无损转回 ${target}（含不可表达字符），放弃：${uri.fsPath}`);
       }
     }
     return;
@@ -1844,11 +1861,26 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
     isUtfFamily(prev) &&
     hasStrongCJK(decodeWith(enc, full) ?? "")
   ) {
+    // 跨平台注册表仲裁：登记为非 UTF 族（最近某平台确认是 GBK 等）→ 与
+    // 磁盘一致，接受现状并同步本地历史，防止与其它平台方向相反的拉锯
+    const reg = readEncReg(uri.fsPath);
+    if (reg && !isUtfFamily(reg.enc)) {
+      setLastEnc(uri.toString(), enc);
+      L(
+        `跨平台登记为 ${reg.enc}（${reg.platform}），与磁盘一致，接受现状：${uri.fsPath}`
+      );
+      return;
+    }
     // 磁盘编码违背内容声明（如 XML 声明 utf-8、磁盘却是 GBK）→ 以声明为
-    // 修复目标（工具链按声明解码，声明优先于历史编码记录）；无声明或声明
-    // 即当前编码时才按历史回滚为 utf8
+    // 修复目标（工具链按声明解码，声明优先于历史编码记录）；无声明时按
+    // 注册表（跨平台共识），最后才是 utf8
     const declared = declaredEncoding(head);
-    const target = declared && !isUtfFamily(declared) ? declared : "utf8";
+    const target =
+      declared && !isUtfFamily(declared)
+        ? declared
+        : reg && isUtfFamily(reg.enc)
+          ? reg.enc
+          : "utf8";
     if (declared && !isUtfFamily(declared)) {
       L(
         `磁盘编码 ${enc} 违背内容声明 ${declared}，按声明编码修复：${uri.fsPath}`
@@ -1955,6 +1987,50 @@ function finishClaim(fsPath: string, enc: string): void {
   forceClaim(fsPath, enc, "done");
 }
 
+// ===== 跨平台编码注册表（回滚方向权威仲裁）=====
+// lastEnc 存于各平台自己的 globalState，Trae 与 VSCode 互不可见——同一共享
+// 文件两边历史不同（一边 gbk 一边 utf8）时，迁移回滚方向相反：租约只能
+// 串行化"每一次"修复，管不住方向相反的连续拉锯（表现为连续抢注转码，
+// 直到 3 次熔断才停）。注册表落文件系统（claims 目录，全平台可见）：
+// 修复/手动转换完成后登记"文件当前编码"，回滚前先查注册表——登记与磁盘
+// 一致就接受现状并同步本地历史，方向分歧从源头消除。TTL 7 天防陈旧登记
+const ENC_REG_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+function encRegPath(fsPath: string): string {
+  return claimPath(fsPath).replace(/\.json$/, ".enc.json");
+}
+
+function readEncReg(fsPath: string): EncClaim | null {
+  try {
+    const reg = JSON.parse(
+      fs.readFileSync(encRegPath(fsPath), "utf8")
+    ) as EncClaim;
+    if (reg.enc && Date.now() - reg.time < ENC_REG_TTL_MS) {
+      return reg;
+    }
+  } catch {
+    // 无登记/损坏 → 视为无
+  }
+  return null;
+}
+
+function writeEncReg(fsPath: string, enc: string): void {
+  try {
+    fs.mkdirSync(CLAIM_DIR, { recursive: true });
+    fs.writeFileSync(
+      encRegPath(fsPath),
+      JSON.stringify({
+        platform: platformId(),
+        time: Date.now(),
+        status: "done" as const,
+        enc,
+      })
+    );
+  } catch {
+    // 登记失败不阻断主流程
+  }
+}
+
 // ===== 修复租约（选主机制）=====
 // 同一工作区多开实例（Trae/Cursor/VSCode）时，各实例的 watcher 都会看到
 // 同一次外部写入并独立触发修复。同向修复幂等但浪费 IO；反向修复（各实例
@@ -2019,6 +2095,9 @@ function pruneClaims(): void {
   try {
     const deadline = Date.now() - CLAIM_TTL_MS * 10;
     for (const f of fs.readdirSync(CLAIM_DIR)) {
+      if (f.endsWith(".enc.json")) {
+        continue; // 编码注册表有自己的 7 天 TTL（读取时校验），不按 claim 清理
+      }
       const p = path.join(CLAIM_DIR, f);
       try {
         if (fs.statSync(p).mtimeMs < deadline) {
@@ -2148,6 +2227,7 @@ function normalizeNewFileEncoding(uri: vscode.Uri): void {
     fs.writeFileSync(uri.fsPath, converted);
     finishClaim(uri.fsPath, defEnc);
     setLastEnc(key, defEnc);
+    writeEncReg(uri.fsPath, defEnc); // 跨平台登记（方向仲裁依据）
     const fp = diskFingerprint(uri);
     watcherDone.set(key, fp);
     autoDone.set(key, fp);
