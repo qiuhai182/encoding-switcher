@@ -1370,6 +1370,16 @@ async function fixOpenTabEncoding(uri: vscode.Uri, targetEnc: string): Promise<v
 // 修复互斥：同一文件的修复不并发（静默窗口期间 watcher 可能再触发）
 const repairing = new Set<string>();
 
+// 近期判定为编码损坏/未知编码的文件（10 分钟内归一功能禁入）：
+// mainframe.cpp 事故——文件处于 unknown 损坏态时被「新文件归一」按 gbk
+// 字节直转 utf8，把乱码锁死。归一必须给修复让路
+const corruptSeen = new Map<string, number>();
+const CORRUPT_SKIP_MS = 10 * 60 * 1000;
+
+// 本插件曾确认含中文的文件：外部写入后中文消失且出现成片 '?' → 中文
+// 已被不可逆替换（如 AI 以 latin1/cp1252 写盘），兜底告警
+const fileHadCJK = new Map<string, boolean>();
+
 // 执行修复（选主版）：跨进程抢修复租约，同一文件同一时刻只有一个实例动手
 async function executeRepair(
   uri: vscode.Uri,
@@ -1481,6 +1491,7 @@ async function executeRepairInner(
   });
   setLastEnc(key, result.encoding);
   writeEncReg(uri.fsPath, result.encoding); // 跨平台登记当前编码（方向仲裁依据）
+  corruptSeen.delete(key); // 已修复，解除归一禁入
   watcherDone.set(key, goodFp);
   encodingView?.refresh(uri.fsPath);
   const kindLabel =
@@ -1761,11 +1772,17 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
     fp = diskFingerprint(uri);
     watcherDone.set(key, fp);
     if (detectHeadTolerant(re, candidates) === "unknown") {
+      corruptSeen.set(key, Date.now());
       // 日志文件由程序持续写入，截断/异常字节概率高，只记日志不弹窗
       if (ext === "log") {
         L(`无法识别编码（可能仍在写入或含异常字节）：${uri.fsPath}`);
       } else {
-        warnCorrupted(uri);
+        // 守护缺口修复：unknown 不再只告警——先尝试混合/双重转码修复
+        // （内部失败时才告警），mainframe.cpp 事故中 7 次告警零次修复
+        await tryRepairCorrupted(
+          uri,
+          fs.readFileSync(uri.fsPath)
+        );
       }
     }
     return;
@@ -1805,6 +1822,26 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
   }
   fp = diskFingerprint(uri);
   watcherDone.set(key, fp);
+
+  // 成片 '?' 兜底告警：本插件曾确认该文件含中文，外部写入后中文消失且
+  // 出现成片 '?' → 中文已被不可逆替换（如 AI 以 latin1/cp1252 写盘，
+  // mainframe.cpp / dlgpermitapply.cpp 事故同型）。无法自动修复（字节
+  // 已丢失），必须立即明确告知用版本管理恢复
+  const fullText = decodeWith(enc, full);
+  if (fullText) {
+    if (containsCJK(fullText)) {
+      fileHadCJK.set(key, true);
+    } else if (fileHadCJK.has(key) && /\?{4,}/.test(fullText)) {
+      fileHadCJK.delete(key);
+      const name = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
+      L(`检测到中文内容被成片替换为 ?（不可逆损坏）：${uri.fsPath}`);
+      warnWithOpenFile(
+        `${name} 的中文内容已被外部程序（可能是 AI）替换成 ?（信息已丢失，无法自动修复）。` +
+          `请用版本管理恢复该文件，再让 AI 以正确编码重新读取后修改`,
+        uri
+      );
+    }
+  }
 
   // 声明优先（任何带编码声明的文件）：磁盘编码与声明不同族且内容含中文
   // 时，以声明为目标转回（migrate 无损校验保证转码后中文显示正常）；
@@ -2218,6 +2255,13 @@ function normalizeNewFileEncoding(uri: vscode.Uri): void {
   }
   normalizePending.add(key);
   try {
+    // 近期判定为编码损坏的文件禁入：归一是字节直转，会把乱码原样锁进
+    // 新编码（mainframe.cpp 事故）；给修复流程让路
+    const cs = corruptSeen.get(key);
+    if (cs && Date.now() - cs < CORRUPT_SKIP_MS) {
+      L(`文件近期判定为编码损坏，归一禁入：${uri.fsPath}`);
+      return;
+    }
     let bytes: Buffer;
     try {
       bytes = fs.readFileSync(uri.fsPath);
