@@ -270,36 +270,86 @@ async function detectReopenEncodingCmd(): Promise<void> {
   }
 }
 
-// 指定编码重开（统一入口）：优先内核命令；Trae 内核无 reopenWithEncoding
-// 命令时（探测见 14:31:03 日志），退化为「临时改 files.encoding + 暂停
-// autoGuessEncoding + revertFile 强制重解码」，完成后恢复原设置——否则
-// 转换/修复后状态栏编码标签永远停在旧值，用户会以为转换没生效
-async function reopenDocWithEncoding(
-  uri: vscode.Uri,
-  encLabel: string
-): Promise<void> {
-  if (reopenEncodingCmd) {
-    markInternalReopen(uri);
-    await vscode.commands.executeCommand(reopenEncodingCmd, uri, encLabel);
-    return;
-  }
-  const filesCfg = vscode.workspace.getConfiguration("files", uri);
-  const hasWs = !!vscode.workspace.workspaceFolders?.length;
-  const scope = hasWs
+// ===== 编码覆盖（临时改 files.encoding + 暂停 autoGuessEncoding）=====
+// 覆盖期间内核重开/重开文档都会按指定编码解码。apply/restore 拆开是为了让
+// 调用方能把覆盖包住整个重开流程（含关闭重开），而不是只包住单条命令
+
+type EncodingOverride = {
+  filesCfg: vscode.WorkspaceConfiguration;
+  scope: vscode.ConfigurationTarget;
+  oldEnc?: string;
+  oldGuess?: boolean;
+};
+
+// 覆盖写入的作用域跟随文件：工作区内文件写工作区设置，工作区外文件
+// （如临时目录）必须写用户设置——写错作用域对目标文件不生效
+function encodingOverrideScope(uri: vscode.Uri): vscode.ConfigurationTarget {
+  return vscode.workspace.getWorkspaceFolder(uri)
     ? vscode.ConfigurationTarget.Workspace
     : vscode.ConfigurationTarget.Global;
-  const scopeKey = hasWs ? "workspaceValue" : "globalValue";
-  const encInspect = filesCfg.inspect<string>("encoding");
-  const guessInspect = filesCfg.inspect<boolean>("autoGuessEncoding");
-  const oldEnc = encInspect ? encInspect[scopeKey] : undefined;
-  const oldGuess = guessInspect ? guessInspect[scopeKey] : undefined;
+}
+
+async function applyEncodingOverride(
+  uri: vscode.Uri,
+  encLabel: string
+): Promise<EncodingOverride | null> {
   try {
+    const filesCfg = vscode.workspace.getConfiguration("files", uri);
+    const scope = encodingOverrideScope(uri);
+    const scopeKey =
+      scope === vscode.ConfigurationTarget.Workspace
+        ? "workspaceValue"
+        : "globalValue";
+    const encInspect = filesCfg.inspect<string>("encoding");
+    const guessInspect = filesCfg.inspect<boolean>("autoGuessEncoding");
+    const ov: EncodingOverride = {
+      filesCfg,
+      scope,
+      oldEnc: encInspect ? encInspect[scopeKey] : undefined,
+      oldGuess: guessInspect ? guessInspect[scopeKey] : undefined,
+    };
     await filesCfg.update(
       "encoding",
       vscodeEncodingLabel(encLabel).toLowerCase(),
       scope
     );
     await filesCfg.update("autoGuessEncoding", false, scope);
+    return ov;
+  } catch (e) {
+    L(`应用编码覆盖失败: ${String(e)}`);
+    return null;
+  }
+}
+
+async function restoreEncodingOverride(ov: EncodingOverride): Promise<void> {
+  try {
+    await ov.filesCfg.update("encoding", ov.oldEnc, ov.scope);
+    await ov.filesCfg.update("autoGuessEncoding", ov.oldGuess, ov.scope);
+  } catch {
+    // 恢复失败不阻断（值仅短暂变更，下次用户改动设置会覆盖）
+  }
+}
+
+// 指定编码重开（统一入口）：优先内核命令；Trae 内核无 reopenWithEncoding
+// 命令时（探测见 14:31:03 日志），退化为「临时改 files.encoding + 暂停
+// autoGuessEncoding + revertFile 强制重解码」，完成后恢复原设置——否则
+// 转换/修复后状态栏编码标签永远停在旧值，用户会以为转换没生效。
+// externalOv：调用方已自行应用覆盖时传入，这里不再重复应用/恢复
+async function reopenDocWithEncoding(
+  uri: vscode.Uri,
+  encLabel: string,
+  externalOv?: EncodingOverride
+): Promise<void> {
+  if (reopenEncodingCmd) {
+    markInternalReopen(uri);
+    await vscode.commands.executeCommand(reopenEncodingCmd, uri, encLabel);
+    return;
+  }
+  const ov = externalOv ?? (await applyEncodingOverride(uri, encLabel));
+  if (!ov) {
+    return;
+  }
+  try {
     const doc = findByUri(uri) ?? (await vscode.workspace.openTextDocument(uri));
     await vscode.window.showTextDocument(doc, {
       preview: false,
@@ -309,11 +359,8 @@ async function reopenDocWithEncoding(
     await vscode.commands.executeCommand("workbench.action.files.revertFile");
     L(`已按 ${encLabel} 重载文件（files.encoding 临时切换方案）：${uri.fsPath}`);
   } finally {
-    try {
-      await filesCfg.update("encoding", oldEnc, scope);
-      await filesCfg.update("autoGuessEncoding", oldGuess, scope);
-    } catch {
-      // 恢复失败不阻断（值仅短暂变更，下次用户改动设置会覆盖）
+    if (!externalOv) {
+      await restoreEncodingOverride(ov);
     }
   }
 }
@@ -598,71 +645,83 @@ async function reopenDisplayedCorrectly(
     return false;
   }
 
-  // 首选：指定编码重开（内核命令；无命令的 Trae 内核退化为
-  // files.encoding 临时切换 + revertFile，见 reopenDocWithEncoding）
+  // 内核没有编码重开命令时（Trae 内核：reopenWithEncoding、revertFile 都没有），
+  // 临时切换 files.encoding 并让覆盖包住整个重开流程（含下面的关闭重开），
+  // 全部完成后再恢复——之前覆盖只包住 revertFile，该命令不存在时设置被立即
+  // 回滚，关闭重开只能按原设置再次猜错，导致重开策略从未成功过（日志证实）
+  const useOverride = !reopenEncodingCmd;
+  const ov = useOverride ? await applyEncodingOverride(uri, encLabel) : null;
   try {
-    await reopenDocWithEncoding(uri, encLabel);
-    if (await displayedOK(10)) {
-      L(`指定编码重开(${encLabel})成功：${uri.fsPath}`);
-      return true;
-    }
-    L(`指定编码重开(${encLabel})后显示仍不正确：${uri.fsPath}`);
-  } catch (e) {
-    L(`指定编码重开异常: ${String(e)}`);
-  }
-
-  // 只尝试一次：内核的猜测是确定性的（同样字节永远猜同样结果），
-  // 多次关闭重开不会改变结果，失败即转只读视图，减少闪烁与等待
-  for (let attempt = 1; attempt <= 1; attempt++) {
-    // 关闭编辑器前复查：用户可能已开始编辑（isDirty），绝不能关掉正在编辑的标签
-    const dc = findByUri(uri);
-    if (dc && dc.isDirty) {
-      L(`放弃重开（用户正在编辑）：${uri.fsPath}`);
-      return false;
-    }
-    // 关闭该 uri 的所有编辑器，释放旧解码缓存的文档模型
-    let closed = 0;
-    for (const d of [...vscode.workspace.textDocuments]) {
-      if (d.uri.toString() !== uri.toString()) {
-        continue;
-      }
-      try {
-        await vscode.window.showTextDocument(d, { preview: false });
-        await vscode.commands.executeCommand("workbench.action.closeActiveEditor");
-        closed++;
-      } catch {
-        // 忽略
-      }
-      await sleep(60);
-    }
-    // 等待旧文档模型真正销毁（textDocuments 中不再包含该 uri），
-    // 未释放就重开会命中旧缓存，导致重开无效、反复刷新
-    let released = false;
-    for (let i = 0; i < 20; i++) {
-      await sleep(150);
-      if (!findByUri(uri)) {
-        released = true;
-        break;
-      }
-    }
-    L(
-      `第${attempt}次：关闭${closed}个编辑器，模型${released ? "已释放" : "未及时释放（继续尝试）"}`
-    );
-
-    let reopened = false;
+    // 首选：指定编码重开（内核命令；无命令的 Trae 内核退化为
+    // files.encoding 临时切换 + revertFile，见 reopenDocWithEncoding）
     try {
-      markInternalReopen(uri); // 重开会重建文档模型，标记为内部事件
-      const nd = await vscode.workspace.openTextDocument(uri);
-      await vscode.window.showTextDocument(nd, { preview: false });
-      reopened = true;
+      await reopenDocWithEncoding(uri, encLabel, ov ?? undefined);
+      if (await displayedOK(10)) {
+        L(`指定编码重开(${encLabel})成功：${uri.fsPath}`);
+        return true;
+      }
+      L(`指定编码重开(${encLabel})后显示仍不正确：${uri.fsPath}`);
     } catch (e) {
-      L(`重开异常（第${attempt}次）: ${String(e)}`);
+      L(`指定编码重开异常: ${String(e)}`);
     }
-    if (reopened && (await displayedOK(10))) {
-      L(`第${attempt}次关闭重开后显示正确：${uri.fsPath}`);
-      return true;
+
+    // 只尝试一次：内核的猜测是确定性的（同样字节永远猜同样结果），
+    // 多次关闭重开不会改变结果，失败即转只读视图，减少闪烁与等待
+    for (let attempt = 1; attempt <= 1; attempt++) {
+      // 关闭编辑器前复查：用户可能已开始编辑（isDirty），绝不能关掉正在编辑的标签
+      const dc = findByUri(uri);
+      if (dc && dc.isDirty) {
+        L(`放弃重开（用户正在编辑）：${uri.fsPath}`);
+        return false;
+      }
+      // 关闭该 uri 的所有编辑器，释放旧解码缓存的文档模型
+      let closed = 0;
+      for (const d of [...vscode.workspace.textDocuments]) {
+        if (d.uri.toString() !== uri.toString()) {
+          continue;
+        }
+        try {
+          await vscode.window.showTextDocument(d, { preview: false });
+          await vscode.commands.executeCommand("workbench.action.closeActiveEditor");
+          closed++;
+        } catch {
+          // 忽略
+        }
+        await sleep(60);
+      }
+      // 等待旧文档模型真正销毁（textDocuments 中不再包含该 uri），
+      // 未释放就重开会命中旧缓存，导致重开无效、反复刷新
+      let released = false;
+      for (let i = 0; i < 20; i++) {
+        await sleep(150);
+        if (!findByUri(uri)) {
+          released = true;
+          break;
+        }
+      }
+      L(
+        `第${attempt}次：关闭${closed}个编辑器，模型${released ? "已释放" : "未及时释放（继续尝试）"}`
+      );
+
+      let reopened = false;
+      try {
+        markInternalReopen(uri); // 重开会重建文档模型，标记为内部事件
+        const nd = await vscode.workspace.openTextDocument(uri);
+        await vscode.window.showTextDocument(nd, { preview: false });
+        reopened = true;
+      } catch (e) {
+        L(`重开异常（第${attempt}次）: ${String(e)}`);
+      }
+      if (reopened && (await displayedOK(10))) {
+        L(`第${attempt}次关闭重开后显示正确：${uri.fsPath}`);
+        return true;
+      }
+      L(`第${attempt}次关闭重开后仍未正确显示：${uri.fsPath}`);
     }
-    L(`第${attempt}次关闭重开后仍未正确显示：${uri.fsPath}`);
+  } finally {
+    if (ov) {
+      await restoreEncodingOverride(ov);
+    }
   }
 
   L(`全部重开策略失败：${uri.fsPath}`);
