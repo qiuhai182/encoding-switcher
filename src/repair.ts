@@ -1,28 +1,28 @@
-// 字节级编码修复模块
+// 瀛楄妭绾х紪鐮佷慨澶嶆ā鍧�
 //
-// 设计原则（对应需求）：
-// 1. 只做"纯字节转码"，绝不重组/重排文本 —— 修复仅改变字符的编码表示，
-//    文本内容、换行符位置一一对应；
-// 2. 行数不变的数学保证：UTF-8 多字节序列（续字节 0x80~0xBF）与
-//    GBK/GB18030 双字节序列（第二字节 0x40~0x7E、0x80~0xFE）都不含 0x0A，
-//    所以纯转码不会把换行符吞进多字节序列 —— 再用计数校验兜底；
-// 3. 三道硬校验，任一失败整体放弃修复（返回 null，交由上层告警）：
-//    a. 无损校验：修复后字节按目标编码解码必须零替换字符（U+FFFD）
-//    b. 行数校验：修复前后 0x0A 字节计数必须相等
-//    c. 回环/行级校验：转码方向上不可表达的字符（如 emoji 转 GBK）行级 round-trip 失败即放弃
-// 4. 不可逆损坏（AI 写盘时已发生 U+FFFD 替换/字符丢失）在数学上无法恢复，
-//    本模块直接返回 null，由上层告警提示。
+// 璁捐鍘熷垯锛堝搴旈渶姹傦級锛�
+// 1. 鍙仛"绾瓧鑺傝浆鐮�"锛岀粷涓嶉噸缁�/閲嶆帓鏂囨湰 鈥斺€� 淇浠呮敼鍙樺瓧绗︾殑缂栫爜琛ㄧず锛�
+//    鏂囨湰鍐呭銆佹崲琛岀浣嶇疆涓€涓€瀵瑰簲锛�
+// 2. 琛屾暟涓嶅彉鐨勬暟瀛︿繚璇侊細UTF-8 澶氬瓧鑺傚簭鍒楋紙缁瓧鑺� 0x80~0xBF锛変笌
+//    GBK/GB18030 鍙屽瓧鑺傚簭鍒楋紙绗簩瀛楄妭 0x40~0x7E銆�0x80~0xFE锛夐兘涓嶅惈 0x0A锛�
+//    鎵€浠ョ函杞爜涓嶄細鎶婃崲琛岀鍚炶繘澶氬瓧鑺傚簭鍒� 鈥斺€� 鍐嶇敤璁℃暟鏍￠獙鍏滃簳锛�
+// 3. 涓夐亾纭牎楠岋紝浠讳竴澶辫触鏁翠綋鏀惧純淇锛堣繑鍥� null锛屼氦鐢变笂灞傚憡璀︼級锛�
+//    a. 鏃犳崯鏍￠獙锛氫慨澶嶅悗瀛楄妭鎸夌洰鏍囩紪鐮佽В鐮佸繀椤婚浂鏇挎崲瀛楃锛圲+FFFD锛�
+//    b. 琛屾暟鏍￠獙锛氫慨澶嶅墠鍚� 0x0A 瀛楄妭璁℃暟蹇呴』鐩哥瓑
+//    c. 鍥炵幆/琛岀骇鏍￠獙锛氳浆鐮佹柟鍚戜笂涓嶅彲琛ㄨ揪鐨勫瓧绗︼紙濡� emoji 杞� GBK锛夎绾� round-trip 澶辫触鍗虫斁寮�
+// 4. 涓嶅彲閫嗘崯鍧忥紙AI 鍐欑洏鏃跺凡鍙戠敓 U+FFFD 鏇挎崲/瀛楃涓㈠け锛夊湪鏁板涓婃棤娉曟仮澶嶏紝
+//    鏈ā鍧楃洿鎺ヨ繑鍥� null锛岀敱涓婂眰鍛婅鎻愮ず銆�
 
 import * as iconv from "iconv-lite";
 import { isUtf8 } from "./encoding";
 
 export interface RepairResult {
-  bytes: Buffer; // 修复后的完整文件字节
-  encoding: string; // 目标编码（= 文件"原本"的编码）
-  kind: "mojibake" | "mixed" | "migrate"; // 双重转码 / 分段混合 / 编码迁移回滚
+  bytes: Buffer; // 淇鍚庣殑瀹屾暣鏂囦欢瀛楄妭
+  encoding: string; // 鐩爣缂栫爜锛�= 鏂囦欢"鍘熸湰"鐨勭紪鐮侊級
+  kind: "mojibake" | "mixed" | "migrate"; // 鍙岄噸杞爜 / 鍒嗘娣峰悎 / 缂栫爜杩佺Щ鍥炴粴
 }
 
-// 解码并要求零替换字符（与 encoding.ts 的 decodeWith 同规则）
+// 瑙ｇ爜骞惰姹傞浂鏇挎崲瀛楃锛堜笌 encoding.ts 鐨� decodeWith 鍚岃鍒欙級
 function decodeWith(encoding: string, bytes: Uint8Array): string | null {
   try {
     const text = iconv.decode(Buffer.from(bytes), encoding);
@@ -32,7 +32,7 @@ function decodeWith(encoding: string, bytes: Uint8Array): string | null {
   }
 }
 
-// 统计 0x0A 字节数（行数兜底校验用）
+// 缁熻 0x0A 瀛楄妭鏁帮紙琛屾暟鍏滃簳鏍￠獙鐢級
 function countNewlines(b: Uint8Array): number {
   let n = 0;
   for (let i = 0; i < b.length; i++) {
@@ -43,18 +43,18 @@ function countNewlines(b: Uint8Array): number {
   return n;
 }
 
-// 是否包含中日韩表意字符
+// 鏄惁鍖呭惈涓棩闊╄〃鎰忓瓧绗�
 export function containsCJK(text: string): boolean {
   return /[\u3400-\u4dbf\u4e00-\u9fff]/.test(text);
 }
 
-// 强 CJK 判定：必须出现"成词"的表意文字才可信。
-// 背景：罗马尼亚语/法语等欧洲语言文件经 GBK 解码时，变音字母与相邻字节
-// 会随机对撞出零星 CJK 字符（如 ro locale 全文恰好对撞出 2 个），
-// 仅凭 containsCJK（1 个即可）不足以支撑一次主动改写文件的修复，
-// 曾导致把干净的欧洲语言 UTF-8 文件误判为 GBK 双重转码并"修复"损坏。
-// 门槛：CJK 字符 ≥3 且 相邻 CJK 对 ≥2 —— 真实中文词组（≥3 字词）
-// 必然满足；随机对撞几乎不可能产生连续 CJK。
+// 寮� CJK 鍒ゅ畾锛氬繀椤诲嚭鐜�"鎴愯瘝"鐨勮〃鎰忔枃瀛楁墠鍙俊銆�
+// 鑳屾櫙锛氱綏椹凹浜氳/娉曡绛夋娲茶瑷€鏂囦欢缁� GBK 瑙ｇ爜鏃讹紝鍙橀煶瀛楁瘝涓庣浉閭诲瓧鑺�
+// 浼氶殢鏈哄鎾炲嚭闆舵槦 CJK 瀛楃锛堝 ro locale 鍏ㄦ枃鎭板ソ瀵规挒鍑� 2 涓級锛�
+// 浠呭嚟 containsCJK锛�1 涓嵆鍙級涓嶈冻浠ユ敮鎾戜竴娆′富鍔ㄦ敼鍐欐枃浠剁殑淇锛�
+// 鏇惧鑷存妸骞插噣鐨勬娲茶瑷€ UTF-8 鏂囦欢璇垽涓� GBK 鍙岄噸杞爜骞�"淇"鎹熷潖銆�
+// 闂ㄦ锛欳JK 瀛楃 鈮�3 涓� 鐩搁偦 CJK 瀵� 鈮�2 鈥斺€� 鐪熷疄涓枃璇嶇粍锛堚墺3 瀛楄瘝锛�
+// 蹇呯劧婊¤冻锛涢殢鏈哄鎾炲嚑涔庝笉鍙兘浜х敓杩炵画 CJK銆�
 export function hasStrongCJK(text: string): boolean {
   let cjk = 0;
   let pairs = 0;
@@ -72,13 +72,13 @@ export function hasStrongCJK(text: string): boolean {
   return cjk >= 3 && pairs >= 2;
 }
 
-// cp1252 在 0x80~0x9F 区间映射出的特殊字符（€???… 等）
+// cp1252 鍦� 0x80~0x9F 鍖洪棿鏄犲皠鍑虹殑鐗规畩瀛楃锛堚偓???鈥� 绛夛級
 const CP1252_SPECIAL = /^[\u20ac\u201a\u0192\u201e\u2026\u2020\u2021\u02c6\u2030\u0160\u2039\u0152\u017d\u2018\u2019\u201c\u201d\u2022\u2013\u2014\u02dc\u2122\u0161\u203a\u0153\u017e\u0178]$/;
 
-// 双重转码快速预判：UTF-8 解码出的文本应"几乎全是 Latin 字符"。
-// 正常 UTF-8 中文文件的文本含大量 CJK（码点 >0xFF），此判定为 false，
-// 因此不会误伤正常中文文件；双重转码 mojibake（GBK 字节经 latin1 路径
-// 变成 UTF-8）的文本则几乎全在 Latin 区。
+// 鍙岄噸杞爜蹇€熼鍒わ細UTF-8 瑙ｇ爜鍑虹殑鏂囨湰搴�"鍑犱箮鍏ㄦ槸 Latin 瀛楃"銆�
+// 姝ｅ父 UTF-8 涓枃鏂囦欢鐨勬枃鏈惈澶ч噺 CJK锛堢爜鐐� >0xFF锛夛紝姝ゅ垽瀹氫负 false锛�
+// 鍥犳涓嶄細璇激姝ｅ父涓枃鏂囦欢锛涘弻閲嶈浆鐮� mojibake锛圙BK 瀛楄妭缁� latin1 璺緞
+// 鍙樻垚 UTF-8锛夌殑鏂囨湰鍒欏嚑涔庡叏鍦� Latin 鍖恒€�
 export function isMojibakeText(text: string): boolean {
   if (text.length === 0) {
     return false;
@@ -94,7 +94,7 @@ export function isMojibakeText(text: string): boolean {
         ext++;
       }
     } else {
-      // 允许少量 cp1252 特征字符（0x80~0x9F 区间映射出的标点/符号）
+      // 鍏佽灏戦噺 cp1252 鐗瑰緛瀛楃锛�0x80~0x9F 鍖洪棿鏄犲皠鍑虹殑鏍囩偣/绗﹀彿锛�
       if (CP1252_SPECIAL.test(ch)) {
         latin++;
         ext++;
@@ -103,15 +103,15 @@ export function isMojibakeText(text: string): boolean {
       }
     }
   }
-  // 至少 2 个扩展 Latin 字符（纯 ASCII 无转码意义），且非 Latin 占比极低
+  // 鑷冲皯 2 涓墿灞� Latin 瀛楃锛堢函 ASCII 鏃犺浆鐮佹剰涔夛級锛屼笖闈� Latin 鍗犳瘮鏋佷綆
   return ext >= 2 && other / (latin + other) < 0.05;
 }
 
-// 可逆 mojibake 判定：文本像双重转码，且能经 latin1/cp1252 逆向无损还原。
-// 用于修复/告警触发前的把关：正常的欧洲语言文本（罗马尼亚语 ă/ș/ț、
-// 波兰语 ł 等latin1 不可表达的字符）逆向时会被替换成 '?'，回读不一致，
-// 据此把它们从 mojibake 候选里排除，防止把干净文件"修复"成损坏。
-// 尾部单个 U+FFFD 视为头部截断伪影（64KB 头部切断多字节序列），剔除后验证。
+// 鍙€� mojibake 鍒ゅ畾锛氭枃鏈儚鍙岄噸杞爜锛屼笖鑳界粡 latin1/cp1252 閫嗗悜鏃犳崯杩樺師銆�
+// 鐢ㄤ簬淇/鍛婅瑙﹀彂鍓嶇殑鎶婂叧锛氭甯哥殑娆ф床璇█鏂囨湰锛堢綏椹凹浜氳 膬/葯/葲銆�
+// 娉㈠叞璇� 艂 绛塴atin1 涓嶅彲琛ㄨ揪鐨勫瓧绗︼級閫嗗悜鏃朵細琚浛鎹㈡垚 '?'锛屽洖璇讳笉涓€鑷达紝
+// 鎹鎶婂畠浠粠 mojibake 鍊欓€夐噷鎺掗櫎锛岄槻姝㈡妸骞插噣鏂囦欢"淇"鎴愭崯鍧忋€�
+// 灏鹃儴鍗曚釜 U+FFFD 瑙嗕负澶撮儴鎴柇浼奖锛�64KB 澶撮儴鍒囨柇澶氬瓧鑺傚簭鍒楋級锛屽墧闄ゅ悗楠岃瘉銆�
 export function isReversibleMojibakeText(text: string): boolean {
   if (!isMojibakeText(text)) {
     return false;
@@ -124,37 +124,37 @@ export function isReversibleMojibakeText(text: string): boolean {
         return true;
       }
     } catch {
-      // 忽略
+      // 蹇界暐
     }
   }
   return false;
 }
 
-// 模式一：双重转码修复（可逆）
-// 损坏路径：原 GBK 等编码字节 --latin1/cp1252 逐字节解读--> 字符串 --UTF-8 写盘--> 现文件
-// 修复路径：现字节 --UTF-8 解码--> mojibake 字符串 --latin1/cp1252 编码--> 厘米原字节
-// 再用候选编码验证原字节无损且含中文，验证通过的候选即为目标编码
+// 妯″紡涓€锛氬弻閲嶈浆鐮佷慨澶嶏紙鍙€嗭級
+// 鎹熷潖璺緞锛氬師 GBK 绛夌紪鐮佸瓧鑺� --latin1/cp1252 閫愬瓧鑺傝В璇�--> 瀛楃涓� --UTF-8 鍐欑洏--> 鐜版枃浠�
+// 淇璺緞锛氱幇瀛楄妭 --UTF-8 瑙ｇ爜--> mojibake 瀛楃涓� --latin1/cp1252 缂栫爜--> 鍘樼背鍘熷瓧鑺�
+// 鍐嶇敤鍊欓€夌紪鐮侀獙璇佸師瀛楄妭鏃犳崯涓斿惈涓枃锛岄獙璇侀€氳繃鐨勫€欓€夊嵆涓虹洰鏍囩紪鐮�
 function tryFixMojibake(
   bytes: Buffer,
   candidates: string[],
   nlCount: number
 ): RepairResult | null {
   if (!isUtf8(bytes)) {
-    return null; // 双重转码的文件必然是合法 UTF-8
+    return null; // 鍙岄噸杞爜鐨勬枃浠跺繀鐒舵槸鍚堟硶 UTF-8
   }
   const text = bytes.toString("utf8");
   if (!isMojibakeText(text)) {
-    return null; // 是正常 UTF-8 内容（含 CJK 等），不处理
+    return null; // 鏄甯� UTF-8 鍐呭锛堝惈 CJK 绛夛級锛屼笉澶勭悊
   }
 
-  // 逆向编码尝试：latin1（字节?码点一一对应，最常见）；文本含 cp1252
-  // 特征字符（>0xFF）时优先 cp1252
+  // 閫嗗悜缂栫爜灏濊瘯锛歭atin1锛堝瓧鑺�?鐮佺偣涓€涓€瀵瑰簲锛屾渶甯歌锛夛紱鏂囨湰鍚� cp1252
+  // 鐗瑰緛瀛楃锛�>0xFF锛夋椂浼樺厛 cp1252
   const attempts: string[] = ["latin1"];
   let hasSpecial = false;
   for (const ch of text) {
     const cp = ch.codePointAt(0) ?? 0;
     if (cp > 0xff && !CP1252_SPECIAL.test(ch)) {
-      hasSpecial = false; // 占位（不会到达：isMojibakeText 已过滤）
+      hasSpecial = false; // 鍗犱綅锛堜笉浼氬埌杈撅細isMojibakeText 宸茶繃婊わ級
       break;
     }
     if (cp > 0xff) {
@@ -172,11 +172,11 @@ function tryFixMojibake(
     } catch {
       continue;
     }
-    // 逆向编码无损校验：latin1/cp1252 表达不了的字符（罗马尼亚语 ă/ș/ț、
-    // 波兰语 ł、越南语 ệ 等）会被 iconv 静默替换成 '?'（0x3F）。
-    // 真 mojibake 的逆向还原是逐字节零替换的；出现 '?' 即说明这是
-    // 正常的欧洲语言文本而非转码损坏，绝不能"修复"（会把字符真弄丢）。
-    // 校验方式：逆向字节按 revEnc 解回必须与原文一致。
+    // 閫嗗悜缂栫爜鏃犳崯鏍￠獙锛歭atin1/cp1252 琛ㄨ揪涓嶄簡鐨勫瓧绗︼紙缃楅┈灏间簹璇� 膬/葯/葲銆�
+    // 娉㈠叞璇� 艂銆佽秺鍗楄 峄� 绛夛級浼氳 iconv 闈欓粯鏇挎崲鎴� '?'锛�0x3F锛夈€�
+    // 鐪� mojibake 鐨勯€嗗悜杩樺師鏄€愬瓧鑺傞浂鏇挎崲鐨勶紱鍑虹幇 '?' 鍗宠鏄庤繖鏄�
+    // 姝ｅ父鐨勬娲茶瑷€鏂囨湰鑰岄潪杞爜鎹熷潖锛岀粷涓嶈兘"淇"锛堜細鎶婂瓧绗︾湡寮勪涪锛夈€�
+    // 鏍￠獙鏂瑰紡锛氶€嗗悜瀛楄妭鎸� revEnc 瑙ｅ洖蹇呴』涓庡師鏂囦竴鑷淬€�
     let back: string | null;
     try {
       const dec = iconv.decode(orig, revEnc);
@@ -188,17 +188,17 @@ function tryFixMojibake(
       continue;
     }
     if (countNewlines(orig) !== nlCount) {
-      continue; // 行数兜底（数学上不会发生）
+      continue; // 琛屾暟鍏滃簳锛堟暟瀛︿笂涓嶄細鍙戠敓锛�
     }
-    // 用候选编码验证还原出的字节：无损解码且含成词中文内容
-    // （强 CJK 门槛：零星对撞出的 1~2 个 CJK 字符不可信）
+    // 鐢ㄥ€欓€夌紪鐮侀獙璇佽繕鍘熷嚭鐨勫瓧鑺傦細鏃犳崯瑙ｇ爜涓斿惈鎴愯瘝涓枃鍐呭
+    // 锛堝己 CJK 闂ㄦ锛氶浂鏄熷鎾炲嚭鐨� 1~2 涓� CJK 瀛楃涓嶅彲淇★級
     for (const cand of candidates) {
       const dec = decodeWith(cand, orig);
       if (dec === null) {
         continue;
       }
       if (!hasStrongCJK(dec)) {
-        continue; // 还原后必须出现中文词组，否则转码无意义
+        continue; // 杩樺師鍚庡繀椤诲嚭鐜颁腑鏂囪瘝缁勶紝鍚﹀垯杞爜鏃犳剰涔�
       }
       return { bytes: orig, encoding: cand, kind: "mojibake" };
     }
@@ -206,18 +206,18 @@ function tryFixMojibake(
   return null;
 }
 
-// 模式二：分段混合编码修复（行级）
-// 场景：原 GBK 文件被 AI 用 UTF-8 追加/改写部分行（或对称场景）。
-// 关键观察：任何多字节序列都不含 0x0A，按 \n 切行不会截断字符，
-// 因此可以逐行判定编码归属，把少数派编码的行无损转成多数派编码。
-// 行内混合（同一行既有原编码又有 AI 写入的编码）无法仅凭字节可靠切分，
-// 该行归为 bad，整体放弃修复（交由上层告警），绝不猜测。
+// 妯″紡浜岋細鍒嗘娣峰悎缂栫爜淇锛堣绾э級
+// 鍦烘櫙锛氬師 GBK 鏂囦欢琚� AI 鐢� UTF-8 杩藉姞/鏀瑰啓閮ㄥ垎琛岋紙鎴栧绉板満鏅級銆�
+// 鍏抽敭瑙傚療锛氫换浣曞瀛楄妭搴忓垪閮戒笉鍚� 0x0A锛屾寜 \n 鍒囪涓嶄細鎴柇瀛楃锛�
+// 鍥犳鍙互閫愯鍒ゅ畾缂栫爜褰掑睘锛屾妸灏戞暟娲剧紪鐮佺殑琛屾棤鎹熻浆鎴愬鏁版淳缂栫爜銆�
+// 琛屽唴娣峰悎锛堝悓涓€琛屾棦鏈夊師缂栫爜鍙堟湁 AI 鍐欏叆鐨勭紪鐮侊級鏃犳硶浠呭嚟瀛楄妭鍙潬鍒囧垎锛�
+// 璇ヨ褰掍负 bad锛屾暣浣撴斁寮冧慨澶嶏紙浜ょ敱涓婂眰鍛婅锛夛紝缁濅笉鐚滄祴銆�
 function tryFixMixed(
   bytes: Buffer,
   candidates: string[],
   nlCount: number
 ): RepairResult | null {
-  // 剥离 BOM（BOM 不参与转码，原样保留）
+  // 鍓ョ BOM锛圔OM 涓嶅弬涓庤浆鐮侊紝鍘熸牱淇濈暀锛�
   let bom: Buffer | null = null;
   let body = bytes;
   if (
@@ -230,7 +230,7 @@ function tryFixMixed(
     body = bytes.subarray(3);
   }
 
-  // 按 \n 切行（\n 保留在行尾；最后可能有无换行的尾行）
+  // 鎸� \n 鍒囪锛圽n 淇濈暀鍦ㄨ灏撅紱鏈€鍚庡彲鑳芥湁鏃犳崲琛岀殑灏捐锛�
   const lines: Buffer[] = [];
   let start = 0;
   for (let i = 0; i < body.length; i++) {
@@ -247,7 +247,7 @@ function tryFixMixed(
   }
 
   type RowClass = "ascii" | "utf8" | "primary" | "bad";
-  // 对每个候选编码做行分类，选第一个"自洽"（无 bad 行、primary 行含中文）的候选
+  // 瀵规瘡涓€欓€夌紪鐮佸仛琛屽垎绫伙紝閫夌涓€涓�"鑷唇"锛堟棤 bad 琛屻€乸rimary 琛屽惈涓枃锛夌殑鍊欓€�
   let best: { cand: string; rows: RowClass[] } | null = null;
   for (const cand of candidates) {
     const rows: RowClass[] = [];
@@ -264,11 +264,11 @@ function tryFixMixed(
       if (isAscii) {
         cls = "ascii";
       } else if (isUtf8(ln) && containsCJK(ln.toString("utf8"))) {
-        cls = "utf8"; // AI 写入的 UTF-8 中文行（优先归类）
+        cls = "utf8"; // AI 鍐欏叆鐨� UTF-8 涓枃琛岋紙浼樺厛褰掔被锛�
       } else if (decodeWith(cand, ln) !== null) {
         cls = "primary";
       } else if (isUtf8(ln)) {
-        cls = "utf8"; // 合法 UTF-8 但非中文内容（符号/其他语言）
+        cls = "utf8"; // 鍚堟硶 UTF-8 浣嗛潪涓枃鍐呭锛堢鍙�/鍏朵粬璇█锛�
       } else {
         cls = "bad";
         bad++;
@@ -276,9 +276,9 @@ function tryFixMixed(
       rows.push(cls);
     }
     if (bad > 0) {
-      continue; // 存在无法归类的行（可能行内混合/损坏），该候选不可自洽
+      continue; // 瀛樺湪鏃犳硶褰掔被鐨勮锛堝彲鑳借鍐呮贩鍚�/鎹熷潖锛夛紝璇ュ€欓€変笉鍙嚜娲�
     }
-    // primary 行必须存在且含中文，确保它真是"内容主体"而非巧合
+    // primary 琛屽繀椤诲瓨鍦ㄤ笖鍚腑鏂囷紝纭繚瀹冪湡鏄�"鍐呭涓讳綋"鑰岄潪宸у悎
     let primaryHasCJK = false;
     for (let i = 0; i < lines.length; i++) {
       if (rows[i] === "primary") {
@@ -293,7 +293,7 @@ function tryFixMixed(
       continue;
     }
     best = { cand, rows };
-    break; // 按配置优先级取第一个自洽候选
+    break; // 鎸夐厤缃紭鍏堢骇鍙栫涓€涓嚜娲藉€欓€�
   }
   if (!best) {
     return null;
@@ -309,25 +309,25 @@ function tryFixMixed(
     }
   }
   if (utf8N === 0) {
-    return null; // 无混合（全文同一编码）
+    return null; // 鏃犳贩鍚堬紙鍏ㄦ枃鍚屼竴缂栫爜锛�
   }
 
-  // 修复方向：把少数派编码的行无损转成多数派编码
+  // 淇鏂瑰悜锛氭妸灏戞暟娲剧紪鐮佺殑琛屾棤鎹熻浆鎴愬鏁版淳缂栫爜
   const parts: Buffer[] = [];
   if (bom) {
     parts.push(bom);
   }
   let target: string;
   if (utf8N <= primaryN) {
-    // 原编码是 cand，AI 用 UTF-8 写入了少数行 → 转回 cand
-    // （平票时偏向 cand：detectionEncodings 本身表达了环境主导编码，
-    //   且行级 round-trip 校验保证任一方向内容都无损）
+    // 鍘熺紪鐮佹槸 cand锛孉I 鐢� UTF-8 鍐欏叆浜嗗皯鏁拌 鈫� 杞洖 cand
+    // 锛堝钩绁ㄦ椂鍋忓悜 cand锛歞etectionEncodings 鏈韩琛ㄨ揪浜嗙幆澧冧富瀵肩紪鐮侊紝
+    //   涓旇绾� round-trip 鏍￠獙淇濊瘉浠讳竴鏂瑰悜鍐呭閮芥棤鎹燂級
     target = cand;
     for (let i = 0; i < lines.length; i++) {
       if (rows[i] === "utf8") {
         const t = lines[i].toString("utf8");
         const enc = iconv.encode(t, cand);
-        // 行级 round-trip 校验：转过去再解回来必须一致（防 emoji 等不可表达字符丢失）
+        // 琛岀骇 round-trip 鏍￠獙锛氳浆杩囧幓鍐嶈В鍥炴潵蹇呴』涓€鑷达紙闃� emoji 绛変笉鍙〃杈惧瓧绗︿涪澶憋級
         if (decodeWith(cand, enc) !== t) {
           return null;
         }
@@ -337,7 +337,7 @@ function tryFixMixed(
       }
     }
   } else if (primaryN < utf8N) {
-    // 原编码是 UTF-8，AI 用 cand 写入了少数行 → 转回 UTF-8
+    // 鍘熺紪鐮佹槸 UTF-8锛孉I 鐢� cand 鍐欏叆浜嗗皯鏁拌 鈫� 杞洖 UTF-8
     target = "utf8";
     for (let i = 0; i < lines.length; i++) {
       if (rows[i] === "primary") {
@@ -351,11 +351,11 @@ function tryFixMixed(
       }
     }
   } else {
-    return null; // 对半分，无法判定主体编码，保守放弃
+    return null; // 瀵瑰崐鍒嗭紝鏃犳硶鍒ゅ畾涓讳綋缂栫爜锛屼繚瀹堟斁寮�
   }
 
   const result = Buffer.concat(parts);
-  // 最终校验：全文按目标编码无损解码 + 行数不变
+  // 鏈€缁堟牎楠岋細鍏ㄦ枃鎸夌洰鏍囩紪鐮佹棤鎹熻В鐮� + 琛屾暟涓嶅彉
   if (target === "utf8") {
     if (!isUtf8(result)) {
       return null;
@@ -369,18 +369,18 @@ function tryFixMixed(
   return { bytes: result, encoding: target, kind: "mixed" };
 }
 
-// ===== 编码迁移回滚：内容无损但编码被整体改写 =====
+// ===== 缂栫爜杩佺Щ鍥炴粴锛氬唴瀹规棤鎹熶絾缂栫爜琚暣浣撴敼鍐� =====
 //
-// 场景：AI 工具正确读出文本后，用错误编码写盘 ——
-//   GBK 文件被整体按 UTF-8 重写（内容正确、编码变 utf8），或对称地
-//   UTF-8 文件被整体按 GBK 重写（内容正确、编码变 gbk）。
-// 修复 = 转回原编码。调用方依据 watcher 的历史编码记录（lastEnc）判定
-// "原编码"，本函数只负责安全转换：
-//   1. 跨编码族校验（UTF 族 ↔ 非 UTF 族才有意义）
-//   2. 当前编码必须无损解码（内容完好是回滚前提）
-//   3. round-trip 校验：转回目标编码再解回来必须与原文一致 ——
-//      拦下目标编码不可表达的字符（如 emoji 转 GBK），防止修复本身丢内容
-//   4. 行数不变校验
+// 鍦烘櫙锛欰I 宸ュ叿姝ｇ‘璇诲嚭鏂囨湰鍚庯紝鐢ㄩ敊璇紪鐮佸啓鐩� 鈥斺€�
+//   GBK 鏂囦欢琚暣浣撴寜 UTF-8 閲嶅啓锛堝唴瀹规纭€佺紪鐮佸彉 utf8锛夛紝鎴栧绉板湴
+//   UTF-8 鏂囦欢琚暣浣撴寜 GBK 閲嶅啓锛堝唴瀹规纭€佺紪鐮佸彉 gbk锛夈€�
+// 淇 = 杞洖鍘熺紪鐮併€傝皟鐢ㄦ柟渚濇嵁 watcher 鐨勫巻鍙茬紪鐮佽褰曪紙lastEnc锛夊垽瀹�
+// "鍘熺紪鐮�"锛屾湰鍑芥暟鍙礋璐ｅ畨鍏ㄨ浆鎹細
+//   1. 璺ㄧ紪鐮佹棌鏍￠獙锛圲TF 鏃� 鈫� 闈� UTF 鏃忔墠鏈夋剰涔夛級
+//   2. 褰撳墠缂栫爜蹇呴』鏃犳崯瑙ｇ爜锛堝唴瀹瑰畬濂芥槸鍥炴粴鍓嶆彁锛�
+//   3. round-trip 鏍￠獙锛氳浆鍥炵洰鏍囩紪鐮佸啀瑙ｅ洖鏉ュ繀椤讳笌鍘熸枃涓€鑷� 鈥斺€�
+//      鎷︿笅鐩爣缂栫爜涓嶅彲琛ㄨ揪鐨勫瓧绗︼紙濡� emoji 杞� GBK锛夛紝闃叉淇鏈韩涓㈠唴瀹�
+//   4. 琛屾暟涓嶅彉鏍￠獙
 export function migrateEncodingBytes(
   bytes: Buffer,
   currentEnc: string,
@@ -392,9 +392,9 @@ export function migrateEncodingBytes(
   const curUtf = currentEnc === "utf8" || currentEnc === "utf-8";
   const tgtUtf = targetEnc === "utf8" || targetEnc === "utf-8";
   if (curUtf === tgtUtf) {
-    return null; // 同族（utf8/utf-8 视为一致），无需迁移
+    return null; // 鍚屾棌锛坲tf8/utf-8 瑙嗕负涓€鑷达級锛屾棤闇€杩佺Щ
   }
-  // 当前编码无损解码（BOM 剥离：内容文本不应含 BOM 字符）
+  // 褰撳墠缂栫爜鏃犳崯瑙ｇ爜锛圔OM 鍓ョ锛氬唴瀹规枃鏈笉搴斿惈 BOM 瀛楃锛�
   let text: string | null;
   if (curUtf) {
     text = bytes.toString("utf8");
@@ -407,9 +407,9 @@ export function migrateEncodingBytes(
   if (text === null || text.length === 0) {
     return null;
   }
-  // 转回目标编码（目标为 UTF 族时统一无 BOM）
+  // 杞洖鐩爣缂栫爜锛堢洰鏍囦负 UTF 鏃忔椂缁熶竴鏃� BOM锛�
   const converted = iconv.encode(text, tgtUtf ? "utf8" : targetEnc);
-  // round-trip 校验：转过去再解回来必须与原文逐字一致
+  // round-trip 鏍￠獙锛氳浆杩囧幓鍐嶈В鍥炴潵蹇呴』涓庡師鏂囬€愬瓧涓€鑷�
   let back: string | null;
   if (tgtUtf) {
     back = isUtf8(converted) ? converted.toString("utf8") : null;
@@ -417,7 +417,7 @@ export function migrateEncodingBytes(
     back = decodeWith(targetEnc, converted);
   }
   if (back !== text) {
-    return null; // 目标编码无法无损表达（emoji 等），放弃修复并交由上层告警
+    return null; // 鐩爣缂栫爜鏃犳硶鏃犳崯琛ㄨ揪锛坋moji 绛夛級锛屾斁寮冧慨澶嶅苟浜ょ敱涓婂眰鍛婅
   }
   if (countNewlines(converted) !== countNewlines(bytes)) {
     return null;
@@ -425,7 +425,7 @@ export function migrateEncodingBytes(
   return converted;
 }
 
-// 修复入口：依次尝试双重转码、分段混合；无法安全修复返回 null
+// 淇鍏ュ彛锛氫緷娆″皾璇曞弻閲嶈浆鐮併€佸垎娈垫贩鍚堬紱鏃犳硶瀹夊叏淇杩斿洖 null
 export function repairEncodedBytes(
   bytes: Buffer,
   candidates: string[]

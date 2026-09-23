@@ -1,19 +1,19 @@
-// 编码检测工具模块（通用化：候选编码由调用方传入，不限定具体编码）
-// 设计思路：
-// 1. 先判断是否为 UTF-8 BOM（EF BB BF），命中返回 "utf-8"。
-// 2. 否则判是否为合法 UTF-8（无 BOM），命中返回 "utf8"（VSCode 中 = UTF-8 无 BOM）。
-//    注意：VSCode 编码标签里 "utf-8" 带 BOM，"utf8" 不带 BOM，二者不可混用。
-// 3. 若不是 UTF-8，按调用方传入的候选编码列表依次试解码，
-//    无替换字符（U+FFFD）即视为命中，返回该编码名。
-// 4. 全部失败返回 "unknown"。
+// 缂栫爜妫€娴嬪伐鍏锋ā鍧楋紙閫氱敤鍖栵細鍊欓€夌紪鐮佺敱璋冪敤鏂逛紶鍏ワ紝涓嶉檺瀹氬叿浣撶紪鐮侊級
+// 璁捐鎬濊矾锛�
+// 1. 鍏堝垽鏂槸鍚︿负 UTF-8 BOM锛圗F BB BF锛夛紝鍛戒腑杩斿洖 "utf-8"銆�
+// 2. 鍚﹀垯鍒ゆ槸鍚︿负鍚堟硶 UTF-8锛堟棤 BOM锛夛紝鍛戒腑杩斿洖 "utf8"锛圴SCode 涓� = UTF-8 鏃� BOM锛夈€�
+//    娉ㄦ剰锛歏SCode 缂栫爜鏍囩閲� "utf-8" 甯� BOM锛�"utf8" 涓嶅甫 BOM锛屼簩鑰呬笉鍙贩鐢ㄣ€�
+// 3. 鑻ヤ笉鏄� UTF-8锛屾寜璋冪敤鏂逛紶鍏ョ殑鍊欓€夌紪鐮佸垪琛ㄤ緷娆¤瘯瑙ｇ爜锛�
+//    鏃犳浛鎹㈠瓧绗︼紙U+FFFD锛夊嵆瑙嗕负鍛戒腑锛岃繑鍥炶缂栫爜鍚嶃€�
+// 4. 鍏ㄩ儴澶辫触杩斿洖 "unknown"銆�
 
 import * as iconv from "iconv-lite";
 
-// 检测结果："utf-8" = UTF-8 with BOM；"utf8" = UTF-8 无 BOM；
-// "unknown" = 无法识别；其余为调用方候选列表中的编码名（iconv-lite 支持的编码）
+// 妫€娴嬬粨鏋滐細"utf-8" = UTF-8 with BOM锛�"utf8" = UTF-8 鏃� BOM锛�
+// "unknown" = 鏃犳硶璇嗗埆锛涘叾浣欎负璋冪敤鏂瑰€欓€夊垪琛ㄤ腑鐨勭紪鐮佸悕锛坕conv-lite 鏀寔鐨勭紪鐮侊級
 export type DetectedEncoding = "utf-8" | "utf8" | "unknown" | (string & {});
 
-// 判断字节序列是否为合法 UTF-8（不含 BOM 判定，调用方已处理 BOM）
+// 鍒ゆ柇瀛楄妭搴忓垪鏄惁涓哄悎娉� UTF-8锛堜笉鍚� BOM 鍒ゅ畾锛岃皟鐢ㄦ柟宸插鐞� BOM锛�
 export function isUtf8(bytes: Uint8Array): boolean {
   let i = 0;
   const n = bytes.length;
@@ -35,7 +35,7 @@ export function isUtf8(bytes: Uint8Array): boolean {
       extra = 3;
       min = 0x10000;
     } else {
-      return false; // 非法首字节
+      return false; // 闈炴硶棣栧瓧鑺�
     }
 
     if (i + extra >= n) {
@@ -52,9 +52,9 @@ export function isUtf8(bytes: Uint8Array): boolean {
     }
 
     if (cp < min) {
-      return false; // 过度编码
+      return false; // 杩囧害缂栫爜
     }
-    // 代理区非法
+    // 浠ｇ悊鍖洪潪娉�
     if (cp >= 0xd800 && cp <= 0xdfff) {
       return false;
     }
@@ -63,8 +63,8 @@ export function isUtf8(bytes: Uint8Array): boolean {
   return true;
 }
 
-// 用 iconv-lite 做权威解码
-// iconv-lite 遇无法解码字节会输出替换字符 U+FFFD（不抛错），需自行判定为非法
+// 鐢� iconv-lite 鍋氭潈濞佽В鐮�
+// iconv-lite 閬囨棤娉曡В鐮佸瓧鑺備細杈撳嚭鏇挎崲瀛楃 U+FFFD锛堜笉鎶涢敊锛夛紝闇€鑷鍒ゅ畾涓洪潪娉�
 function decodeWith(encoding: string, bytes: Uint8Array): string | null {
   try {
     const text = iconv.decode(Buffer.from(bytes), encoding);
@@ -77,8 +77,8 @@ function decodeWith(encoding: string, bytes: Uint8Array): string | null {
   }
 }
 
-// 主检测入口：candidates 为 UTF-8 之外的候选编码列表（按优先级排序），
-// 使用 iconv-lite 支持的编码名（如 gbk、gb18030、big5、shift_jis、cp1252 等）
+// 涓绘娴嬪叆鍙ｏ細candidates 涓� UTF-8 涔嬪鐨勫€欓€夌紪鐮佸垪琛紙鎸変紭鍏堢骇鎺掑簭锛夛紝
+// 浣跨敤 iconv-lite 鏀寔鐨勭紪鐮佸悕锛堝 gbk銆乬b18030銆乥ig5銆乻hift_jis銆乧p1252 绛夛級
 export function detectEncoding(
   bytes: Uint8Array,
   candidates: string[] = ["gbk", "gb18030"]
@@ -87,7 +87,7 @@ export function detectEncoding(
     return "utf8";
   }
 
-  // 1. UTF-8 BOM 直接判定（带 BOM）
+  // 1. UTF-8 BOM 鐩存帴鍒ゅ畾锛堝甫 BOM锛�
   if (
     bytes.length >= 3 &&
     bytes[0] === 0xef &&
@@ -97,15 +97,15 @@ export function detectEncoding(
     return "utf-8";
   }
 
-  // 2. 合法 UTF-8（无 BOM）
+  // 2. 鍚堟硶 UTF-8锛堟棤 BOM锛�
   if (isUtf8(bytes)) {
     return "utf8";
   }
 
-  // 3. 依次尝试候选编码：可完整解码（无替换字符）即命中
+  // 3. 渚濇灏濊瘯鍊欓€夌紪鐮侊細鍙畬鏁磋В鐮侊紙鏃犳浛鎹㈠瓧绗︼級鍗冲懡涓�
   for (const enc of candidates) {
     if (enc === "utf8" || enc === "utf-8") {
-      continue; // 已在上面校验过
+      continue; // 宸插湪涓婇潰鏍￠獙杩�
     }
     if (decodeWith(enc, bytes) !== null) {
       return enc;

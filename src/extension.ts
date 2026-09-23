@@ -705,6 +705,12 @@ async function reopenDisplayedCorrectly(
 
       let reopened = false;
       try {
+        // 诊断：记录重开前配置服务实际可见的编码设置，
+        // 用于确认「覆盖已写入但内核不按 files.encoding 解码」这类内核问题
+        const encChk = vscode.workspace.getConfiguration("files", uri);
+        L(
+          `重开前编码设置：encoding=${encChk.get("encoding")}，autoGuessEncoding=${encChk.get("autoGuessEncoding")}：${uri.fsPath}`
+        );
         markInternalReopen(uri); // 重开会重建文档模型，标记为内部事件
         const nd = await vscode.workspace.openTextDocument(uri);
         await vscode.window.showTextDocument(nd, { preview: false });
@@ -768,7 +774,40 @@ async function reopenDisplayedCorrectly(
       }
     }
   }
+  // 磁盘保护：无论编码检测结果如何，重开失败都说明内核对该文件的解码
+  // 一直是错的，乱码编辑器留在屏幕上，一旦被保存（用户 Ctrl+S 或 AI 写回）
+  // 错误文本就会覆盖原文件，中文内容被替换成 ? 后不可修复
+  // （2026-09-21 日志：mainframe.cpp 就这样被写坏）。
+  // 关掉所有干净的乱码编辑器；有未保存修改的不敢自动关（会丢输入），只警告
+  await closeMojibakeEditors(uri);
   return false;
+}
+
+// 关闭某文件所有干净的乱码编辑器（重开失败后的磁盘保护）
+async function closeMojibakeEditors(uri: vscode.Uri): Promise<void> {
+  for (const d of [...vscode.workspace.textDocuments]) {
+    if (d.uri.toString() !== uri.toString()) {
+      continue;
+    }
+    if (d.isDirty) {
+      L(
+        `乱码编辑器有未保存修改，不敢自动关闭（保存会把乱码写回磁盘）：${uri.fsPath}`
+      );
+      void vscode.window
+        .showWarningMessage(
+          "此文件编码显示不正确且有未保存修改：保存会把乱码写回磁盘并破坏文件，请勿保存；关闭时请选「不保存」，用已打开的正确编码编辑器继续"
+        )
+        .then(() => {});
+      continue;
+    }
+    try {
+      await vscode.window.showTextDocument(d, { preview: false });
+      await vscode.commands.executeCommand("workbench.action.closeActiveEditor");
+      L(`已关闭乱码编辑器（防乱码写回磁盘）：${uri.fsPath}`);
+    } catch {
+      // 单个关闭失败不阻断其余
+    }
+  }
 }
 
 // 将当前文件从源编码转为目标编码并保存（按源编码正确解码，避免中文乱码）
@@ -2407,7 +2446,10 @@ function shouldWatchFile(uri: vscode.Uri): boolean {
     return false;
   }
   const p = uri.fsPath.replace(/\\/g, "/").toLowerCase();
-  return !p.includes("/node_modules/") && !p.includes("/.git/");
+  // 排除：node_modules（第三方库）、.git（版本控制）、编码守护者自身源码
+  // （守护自己会造成自损坏循环：源码从 GBK 转 UTF-8 后，扩展检测到变化又
+  // 改回 GBK，编译产物也被污染，日志里中文全变成 U+FFFD）
+  return !p.includes("/node_modules/") && !p.includes("/.git/") && !p.includes("/encoding-switcher/");
 }
 
 export function activate(context: vscode.ExtensionContext) {
@@ -2499,6 +2541,10 @@ export function activate(context: vscode.ExtensionContext) {
       if (doc.uri.scheme !== "file") {
         return;
       }
+      // 排除编码守护者自身源码（防自损坏循环）
+      if (doc.uri.fsPath.toLowerCase().replace(/\\/g, "/").includes("/encoding-switcher/")) {
+        return;
+      }
       const key = doc.uri.toString();
       if (internalReopen.has(key)) {
         // 内部重开流程重建模型触发的事件，不是用户打开，避免重复处理造成循环
@@ -2522,10 +2568,12 @@ export function activate(context: vscode.ExtensionContext) {
         return;
       }
       if (doc.uri.scheme === "file") {
-        scheduleAutoReopen(doc.uri, true);
-        void encodingView?.syncWithDisk(doc.uri.fsPath); // 视图编码落后于磁盘时自纠
+        // 排除编码守护者自身源码（防自损坏循环）
+        if (!doc.uri.fsPath.toLowerCase().replace(/\\/g, "/").includes("/encoding-switcher/")) {
+          scheduleAutoReopen(doc.uri, true);
+          void encodingView?.syncWithDisk(doc.uri.fsPath);
+        }
       } else if (doc.uri.scheme === VIEW_SCHEME) {
-        // 编码视图：磁盘编码已与视图不一致时，禁编辑/自纠
         void encodingView?.syncWithDisk(doc.uri.fsPath);
       }
     })
@@ -2565,7 +2613,9 @@ export function activate(context: vscode.ExtensionContext) {
   setTimeout(() => {
     for (const doc of vscode.workspace.textDocuments) {
       if (doc.uri.scheme === "file") {
-        scheduleAutoReopen(doc.uri);
+        if (!doc.uri.fsPath.toLowerCase().replace(/\\/g, "/").includes("/encoding-switcher/")) {
+          scheduleAutoReopen(doc.uri);
+        }
       }
     }
   }, 800);
