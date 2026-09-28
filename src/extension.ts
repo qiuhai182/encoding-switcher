@@ -1675,57 +1675,76 @@ async function tryRepairCorrupted(uri: vscode.Uri, full: Buffer): Promise<void> 
 }
 
 // 编码迁移回滚执行：内容无损但编码被整体改写，转回 watcher 记录的上次编码
+// currentEnc：磁盘当前检测到的编码（用于归一登记的新鲜度比对）
 async function tryRepairMigrated(
   uri: vscode.Uri,
   full: Buffer,
   converted: Buffer,
-  targetEnc: string
+  targetEnc: string,
+  currentEnc: string
 ): Promise<void> {
   const key = uri.toString();
   if (repairing.has(key)) {
     scheduleWatchCheck(uri); // 修复进行中，重排队
     return;
   }
+  // 其它实例可能刚纠正过该文件：本实例的标签页若是写坏源头，立即纠正
+  // （异步执行，不阻塞回滚；同族标签页在 fixOpenTabEncoding 内自动跳过）
+  void fixTabFromHint(uri);
   // 多窗口防打架：短时间内被向相反方向回滚 → 多实例争用，熔断告警
   const name0 = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
   if (!noteMigrateAndCheckRace(uri, name0, targetEnc)) {
     return;
   }
-  // 新文件编码归一登记有效期内（本文件刚被某平台实例归一）：接受现状不回滚，
-  // 防止其它平台实例把归一结果（如按其 files.encoding 转成的编码）再转回去
+  // 归一登记有效期内：仅当登记编码与磁盘一致才是真正的"接受现状"。
+  // 登记后磁盘又被写坏（登记过时）→ 不能用它拦回滚，否则文件滞留在
+  // 错误编码（build.bat 事故：手动转回 utf8 后 30 秒被写坏成 gbk，
+  // 60 秒内的登记把回滚拦下，文件一直停在 gbk）
   const claim = getFreshClaim(uri.fsPath);
   if (claim) {
-    L(
-      `文件近期有编码归一登记（${claim.platform} → ${claim.enc}），接受现状不做迁移回滚：${uri.fsPath}`
-    );
-    return;
-  }
-  // 反复对抗熔断：短时间内已被多次回滚又被写坏 → 大概率是 IDE 自动保存
-  // 按错误编码标签反复写盘。继续重写只会无限打架（外部看到"插件在乱改
-  // 编码"）——改为纠正标签页编码根治写入源头，并明确告警
-  const nowMs = Date.now();
-  const ms = migrateStates.get(key);
-  if (ms && nowMs - ms.time < MIGRATE_WINDOW_MS) {
-    ms.count++;
-    ms.time = nowMs;
-    if (ms.count >= MIGRATE_STRIKES) {
-      migrateStates.delete(key);
+    const claimSame =
+      isUtfFamily(claim.enc) === isUtfFamily(currentEnc) &&
+      (isUtfFamily(claim.enc) ||
+        claim.enc.toLowerCase() === currentEnc.toLowerCase());
+    if (claimSame) {
       L(
-        `迁移回滚达 ${MIGRATE_STRIKES} 次仍被写回，停止重写字节，改为纠正标签页编码：${uri.fsPath}`
-      );
-      await fixOpenTabEncoding(uri, targetEnc);
-      const name1 = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
-      warnWithOpenFile(
-        `${name1} 的编码已被反复改写 ${ms.count} 次又写坏 ${MIGRATE_STRIKES} 次，` +
-          `插件已停止反复重写。最常见原因：该文件在编辑器里用错误编码打开且开启了自动保存，` +
-          `每次保存都会写坏编码。已尝试按 ${targetEnc.toUpperCase()} 纠正标签页；` +
-          `若仍反复出现，请关闭该文件标签页后重新打开`,
-        uri
+        `文件近期有编码归一登记（${claim.platform} → ${claim.enc}），与磁盘一致，接受现状不做迁移回滚：${uri.fsPath}`
       );
       return;
     }
-  } else {
-    migrateStates.set(key, { count: 1, time: nowMs });
+    if (claim.status === "claimed") {
+      // 另一实例正在归一（尚未完成），让路避免与其写盘交错
+      L(
+        `文件正在被实例 ${claim.platform} 归一（→ ${claim.enc}），让路不做迁移回滚：${uri.fsPath}`
+      );
+      return;
+    }
+    L(
+      `归一登记（${claim.platform} → ${claim.enc}）与磁盘 ${currentEnc} 不一致（登记后又被写坏），继续回滚：${uri.fsPath}`
+    );
+  }
+  // 反复对抗熔断：本实例 3 分钟内已实际回滚 3 次仍被写坏 → 大概率是
+  // （本实例或其它窗口的）IDE 自动保存按错误编码标签反复写盘。继续重写
+  // 只会无限打架——改为纠正标签页编码根治写入源头，并明确告警。
+  // 计数只发生在本实例真正完成回滚之后（done===true）：让路给其它实例
+  // 租约的落败不算自己的次数，否则会让没干活的实例先熔断、干活的不停
+  const ms = migrateStates.get(key);
+  if (ms && Date.now() - ms.time < MIGRATE_WINDOW_MS && ms.count >= MIGRATE_STRIKES) {
+    migrateStates.delete(key);
+    L(
+      `迁移回滚达 ${MIGRATE_STRIKES} 次仍被写坏，停止重写字节，改为纠正标签页编码：${uri.fsPath}`
+    );
+    await fixOpenTabEncoding(uri, targetEnc);
+    writeTabfixHint(uri.fsPath, targetEnc); // 告知其它实例纠正各自的标签页
+    const name1 = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
+    warnWithOpenFile(
+      `${name1} 的编码已被反复改写（${MIGRATE_STRIKES} 次自动回滚均被写回），` +
+        `插件已停止反复重写。最常见原因：该文件在某个编辑器窗口里用错误编码打开且开启了自动保存，` +
+        `每次保存都会写坏编码。已尝试按 ${targetEnc.toUpperCase()} 纠正本窗口标签页；` +
+        `若仍反复出现，请关闭其它窗口中该文件的标签页后重新打开`,
+      uri
+    );
+    return;
   }
   const ext = fileExt(uri.fsPath);
   if (!isAutoRepairBytes()) {
@@ -1750,6 +1769,17 @@ async function tryRepairMigrated(
       // 字节已转回目标编码：立即同步标签页编码，否则 IDE 自动保存仍按
       // 旧标签（错误编码）写盘，立刻把文件再次写坏 → 无限反复
       await fixOpenTabEncoding(uri, targetEnc);
+      // 通知其它实例纠正各自的标签页（写入源头可能在别的窗口）
+      writeTabfixHint(uri.fsPath, targetEnc);
+      // 记一次"本实例实际完成的回滚"（熔断计数，见上方熔断说明）
+      const st = migrateStates.get(key);
+      const now = Date.now();
+      if (st && now - st.time < MIGRATE_WINDOW_MS) {
+        st.count++;
+        st.time = now;
+      } else {
+        migrateStates.set(key, { count: 1, time: now });
+      }
     }
   } finally {
     repairing.delete(key);
@@ -1982,7 +2012,7 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
   ) {
     const converted = migrateEncodingBytes(full, enc, declared0);
     if (converted) {
-      await tryRepairMigrated(uri, full, converted, declared0);
+      await tryRepairMigrated(uri, full, converted, declared0, enc);
     } else {
       L(
         `内容声明 ${declared0} 与磁盘编码 ${enc} 不符且无法无损转换，保持现状（中文显示正常优先）：${uri.fsPath}`
@@ -2022,7 +2052,7 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
       if (declared && !isUtfFamily(declared)) {
         const converted = migrateEncodingBytes(full, enc, declared);
         if (converted) {
-          await tryRepairMigrated(uri, full, converted, declared);
+          await tryRepairMigrated(uri, full, converted, declared, enc);
         } else {
           L(
             `内容声明 ${declared}，但无法从 ${enc} 无损转回（含不可表达字符），放弃：${uri.fsPath}`
@@ -2053,7 +2083,7 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
       const target = reg && !isUtfFamily(reg.enc) ? reg.enc : prev;
       const converted = migrateEncodingBytes(full, enc, target);
       if (converted) {
-        await tryRepairMigrated(uri, full, converted, target);
+        await tryRepairMigrated(uri, full, converted, target, enc);
       } else {
         L(`疑似编码迁移但无法无损转回 ${target}（含不可表达字符），放弃：${uri.fsPath}`);
       }
@@ -2111,7 +2141,7 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
     }
     const converted = migrateEncodingBytes(full, enc, target);
     if (converted) {
-      await tryRepairMigrated(uri, full, converted, target);
+      await tryRepairMigrated(uri, full, converted, target, enc);
     } else {
       L(`疑似编码迁移但无法无损转回 ${target}（含不可表达字符），放弃：${uri.fsPath}`);
     }
@@ -2310,6 +2340,55 @@ function releaseRepairLease(fsPath: string): void {
     fs.unlinkSync(repairLeasePath(fsPath));
   } catch {
     // 已释放/不存在
+  }
+}
+
+// ===== 跨实例标签页纠正提示 =====
+// 双窗口拉锯的写坏源头通常是"某窗口用错误编码标签打开文件且开了自动保存"，
+// 但 fixOpenTabEncoding 只能纠正本实例的标签页。回滚成功的实例写提示文件
+// （claims 目录，跨进程可见），其它实例在同一文件再出现迁移事件时读取提示、
+// 纠正自己的标签页 —— 从写入源头掐断循环，而不是各实例各自等 3 次熔断
+const TABFIX_TTL_MS = 3 * 60 * 1000;
+
+function tabfixPath(fsPath: string): string {
+  return claimPath(fsPath) + ".tabfix.json";
+}
+
+function writeTabfixHint(fsPath: string, enc: string): void {
+  try {
+    fs.mkdirSync(CLAIM_DIR, { recursive: true });
+    fs.writeFileSync(
+      tabfixPath(fsPath),
+      JSON.stringify({
+        platform: platformId(),
+        time: Date.now(),
+        status: "done" as const,
+        enc,
+      })
+    );
+  } catch {
+    // 写失败不阻断主流程
+  }
+}
+
+// 收到其它实例的纠正提示：本实例该文件的标签页若与目标编码不同族则立即
+// 纠正（防止本实例的自动保存继续把文件写坏）；无提示/过期/自己写的则忽略
+async function fixTabFromHint(uri: vscode.Uri): Promise<void> {
+  try {
+    const hint = JSON.parse(
+      fs.readFileSync(tabfixPath(uri.fsPath), "utf8")
+    ) as EncClaim;
+    if (
+      Date.now() - hint.time >= TABFIX_TTL_MS ||
+      hint.platform === platformId() ||
+      !hint.enc
+    ) {
+      return;
+    }
+    L(`收到实例 ${hint.platform} 的标签页纠正提示（→ ${hint.enc}）：${uri.fsPath}`);
+    await fixOpenTabEncoding(uri, hint.enc);
+  } catch {
+    // 无提示/解析失败 → 忽略
   }
 }
 
