@@ -1045,6 +1045,23 @@ function enqueueAuto(task: () => Promise<void>): void {
 const reopenCooldown = new Map<string, number>();
 const REOPEN_COOLDOWN_MS = 10 * 60 * 1000;
 
+// Diff 审核视图检测：AI（SOLO/Agent）改完文件停在「变更已完成，请确认是否
+// 采纳」时，文件会以 diff 编辑器形式展示。审核期间磁盘处于待定状态（采纳
+// 或撤销均可能）：重开会打断审核，字节修复/归一会与撤销回滚竞态写坏文件
+// （同 mainframe.cpp 事故成因）。此时校验必须静默；diff 关闭后由
+// onDidChangeTabs 监听补做校验，修复链一条不少，只是推迟到内容定稿之后
+function findDiffReviewTab(fsPath: string): vscode.Tab | undefined {
+  const norm = fsPath.replace(/\\/g, "/").toLowerCase();
+  return vscode.window.tabGroups.all
+    .flatMap((g) => g.tabs)
+    .find(
+      (t) =>
+        t.input instanceof vscode.TabInputTextDiff &&
+        (t.input.modified.fsPath.replace(/\\/g, "/").toLowerCase() === norm ||
+          t.input.original.fsPath.replace(/\\/g, "/").toLowerCase() === norm)
+    );
+}
+
 function scheduleAutoReopen(uri: vscode.Uri, verifyAll = false): void {
   enqueueAuto(async () => {
     // 日志类文件被程序持续追加，“全文比对”校验必然与追加竞态失败，
@@ -1062,6 +1079,11 @@ function scheduleAutoReopen(uri: vscode.Uri, verifyAll = false): void {
     const until = reopenCooldown.get(key);
     if (until && Date.now() < until) {
       return; // 冷却期内不重试
+    }
+    // Diff 审核中静默：待确认状态下不重开/不修复，diff 关闭后补校验
+    if (findDiffReviewTab(uri.fsPath)) {
+      L(`审核中静默（diff 待确认，关闭后自动补校验）：${uri.fsPath}`);
+      return;
     }
     const d = findByUri(uri);
     if (!d || d.isDirty || d.uri.scheme !== "file") {
@@ -1799,6 +1821,13 @@ function sameEncFamily(a: string, b: string): boolean {
 async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
   const key = uri.toString();
   let fp = diskFingerprint(uri);
+
+  // Diff 审核中静默：待确认状态下不动字节（修复/归一会与撤销回滚竞态），
+  // diff 关闭后由 onDidChangeTabs 监听补做本次校验
+  if (findDiffReviewTab(uri.fsPath)) {
+    L(`审核中静默（diff 待确认，关闭后自动补校验）：${uri.fsPath}`);
+    return;
+  }
 
   // 回写对抗：修复后的乱码又被写回（指纹=修复前 badFp）时，
   // 无视检查记录强制重检，再次走修复流程（次数上限在下方判断）
@@ -2608,6 +2637,34 @@ export function activate(context: vscode.ExtensionContext) {
     repairStates.delete(key);
   });
   context.subscriptions.push(watcher);
+
+  // Diff 审核结束（采纳/撤销后 diff 编辑器关闭）：文件内容已定稿，
+  // 补做审核期间被静默跳过的校验——显示纠正 + 外部改写校验，链路闭合
+  try {
+    context.subscriptions.push(
+      vscode.window.tabGroups.onDidChangeTabs((e) => {
+        const uris = new Set<string>();
+        for (const t of e.closed) {
+          if (t.input instanceof vscode.TabInputTextDiff) {
+            for (const u of [t.input.original, t.input.modified]) {
+              if (u.scheme === "file" && shouldWatchFile(u)) {
+                uris.add(u.toString());
+              }
+            }
+          }
+        }
+        for (const key of uris) {
+          const u = vscode.Uri.parse(key);
+          L(`diff 已关闭，补做校验：${u.fsPath}`);
+          scheduleAutoReopen(u, true);
+          scheduleWatchCheck(u);
+        }
+      })
+    );
+  } catch {
+    // 内核裁剪 tabGroups 事件时跳过（审核静默退化为「审核期间不干预」，
+    // 校验靠下一次文件事件兜底）
+  }
 
   // 覆盖编辑器启动时恢复的已打开标签（不触发 onDidOpenTextDocument）
   setTimeout(() => {

@@ -1,4 +1,6 @@
 node_modules/
 *.vsix
+.vscode/
 dist/
 Sync_Master_*.c
+output/

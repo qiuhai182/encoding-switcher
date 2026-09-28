@@ -21,12 +21,13 @@ if errorlevel 1 goto fail
 
 echo [4/4] 打包 vsix...
 rem --skip-license: 跳过 LICENSE 警告的交互确认，避免脚本卡在 [y/N] 等待按键
-call npm run package -- --skip-license
+rem --out output: vsix 与构建产物同目录
+call npm run package -- --skip-license --out output
 if errorlevel 1 goto fail
 
 echo.
-echo 构建完成: dist\extension.js
-for %%f in (*.vsix) do echo 安装包: %%f
+echo 构建完成: output\extension.js
+for %%f in (output\*.vsix) do echo 安装包: %%f
 pause
 exit /b 0
 
