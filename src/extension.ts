@@ -1899,6 +1899,16 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
     watcherDone.set(key, fp);
     return; // 非监督范围，静默
   }
+  if (ext === "log") {
+    // 日志文件由被监控程序持续追加（如 gtwcomproc 每 30ms 一行），字节层绝不干预：
+    // 1) 修复前置的 2 秒静默窗口永远等不到 → 「修复放弃」无限风暴 + 连续放弃弹窗；
+    // 2) 日志刚创建/纯 ASCII 阶段会被 detectEncoding 记为 utf8，写入 GBK 中文后
+    //    被误判为「编码迁移」，一旦写入成功会把整份 GBK 日志转成 UTF-8，与后续
+    //    GBK 追加混写，造成无法挽救的混合编码。
+    // 日志属于运行时诊断产物，显示纠正由打开事件负责，这里登记指纹后静默。
+    watcherDone.set(key, fp);
+    return;
+  }
   const head = headBytes(uri.fsPath, 64 * 1024);
   if (!head || head.length === 0) {
     watcherDone.set(key, fp);
@@ -2458,6 +2468,9 @@ function normalizeNewFileEncoding(uri: vscode.Uri): void {
   }
   if (!TEXT_EXTS.has(fileExt(uri.fsPath))) {
     return; // 只处理文本文件，防止误改二进制
+  }
+  if (fileExt(uri.fsPath) === "log") {
+    return; // 日志文件由写日志进程自管编码（多为 GBK），归一转码会与后续追加混写成混合编码
   }
   normalizePending.add(key);
   try {
