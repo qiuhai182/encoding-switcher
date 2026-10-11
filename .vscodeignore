@@ -5,6 +5,7 @@ check-enc.js
 diag-ts.js
 convert_to_utf8.py
 tsconfig.json
+dist/**
 node_modules/**/node_modules/**
 **/*.map
 Sync_Master_Rece.c
