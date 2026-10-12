@@ -2,7 +2,7 @@
 
 git pull github master
 git pull gitee master
-python convert_to_utf8.py
+python convert_to_utf8.py --strip-bom
 git add --all -- ':!nul'
 git commit -m "快捷上传最新可执行文件、代码"
 git push github
