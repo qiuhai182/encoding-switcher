@@ -1012,6 +1012,34 @@ async function updateContext(): Promise<void> {
   );
 }
 
+// 用户主动保存后的编码登记：内核原生保存（状态栏「通过编码保存」/Ctrl+S）不经
+// 过本插件，转换意图无从登记；以保存后磁盘实际编码为准登记 lastEnc 与跨平台
+// 注册表——迁移回滚的仲裁规则是「注册表与磁盘一致即接受现状」，登记后用户的
+// 转换不会再被其它窗口当作 AI 改写而回滚（hmiview.cpp 事故：状态栏转 UTF-8
+// 被按旧 gbk 登记回滚）
+function registerUserSaveEncoding(uri: vscode.Uri): void {
+  const key = uri.toString();
+  try {
+    const bytes = fs.readFileSync(uri.fsPath);
+    const enc = detectEncoding(bytes, getDetectionEncodings());
+    if (enc === "unknown") {
+      return;
+    }
+    const prev = getLastEnc(key);
+    const fp = diskFingerprint(uri);
+    autoDone.set(key, fp);
+    watcherDone.set(key, fp);
+    setLastEnc(key, enc);
+    writeEncReg(uri.fsPath, enc);
+    repairStates.delete(key); // 用户刚保存的内容是最新事实，清除修复对抗状态
+    if (prev && prev !== enc) {
+      L(`用户保存登记编码：${uri.fsPath} ${prev} → ${enc}`);
+    }
+  } catch {
+    // 读取失败忽略（文件可能刚被外部程序独占）
+  }
+}
+
 // ===== 自动检测：打开 GB2312/GBK 文件时自动按正确编码重开，避免乱码 =====
 // 外部改写（AI 直接写文件）时：磁盘字节与编辑器显示可能不一致
 // （内核按旧编码标签解码新字节），同样走重开流程纠正。
@@ -2652,9 +2680,15 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
     vscode.window.onDidChangeActiveTextEditor(() => scheduleContextUpdate())
   );
-  // 保存也可能改变磁盘编码（如系统自带“通过编码保存”），需同步刷新按钮
+  // 保存也可能改变磁盘编码（如系统自带“通过编码保存”），需同步刷新按钮；
+  // 同时把用户主动保存后的磁盘编码登记为用户意图，防止迁移回滚误杀
   context.subscriptions.push(
-    vscode.workspace.onDidSaveTextDocument(() => scheduleContextUpdate())
+    vscode.workspace.onDidSaveTextDocument((doc) => {
+      scheduleContextUpdate();
+      if (doc.uri.scheme === "file") {
+        registerUserSaveEncoding(doc.uri);
+      }
+    })
   );
   context.subscriptions.push(
     vscode.workspace.onDidOpenTextDocument((doc) => {
