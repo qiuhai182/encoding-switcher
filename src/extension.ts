@@ -5,7 +5,7 @@ import * as path from "path";
 import * as crypto from "crypto";
 import * as iconv from "iconv-lite";
 import { detectEncoding, isUtf8 } from "./encoding";
-import { repairEncodedBytes, migrateEncodingBytes, isReversibleMojibakeText, hasStrongCJK, containsCJK, RepairResult } from "./repair";
+import { repairEncodedBytes, migrateEncodingBytes, isReversibleMojibakeText, containsCJK, RepairResult } from "./repair";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -2076,56 +2076,11 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
       await tryRepairCorrupted(uri, full);
       return;
     }
-    // 编码迁移回滚：上次是非 UTF 族、这次变成 UTF-8 且内容含成词中文
-    // （强 CJK 门槛：零星对撞出的汉字不支持一次主动改写文件的回滚）
-    if (
-      prev &&
-      prev !== "unknown" &&
-      !isUtfFamily(prev) &&
-      hasStrongCJK(iconv.decode(body, "utf-8"))
-    ) {
-      const declared = declaredEncoding(head);
-      // 声明为非 UTF 族（如 XML 声明 GB2312、磁盘却是 UTF-8）→ AI/工具的
-      // 写入违背了声明，按声明转回（声明 > 注册表 > 历史）
-      if (declared && !isUtfFamily(declared)) {
-        const converted = migrateEncodingBytes(full, enc, declared);
-        if (converted) {
-          await tryRepairMigrated(uri, full, converted, declared, enc);
-        } else {
-          L(
-            `内容声明 ${declared}，但无法从 ${enc} 无损转回（含不可表达字符），放弃：${uri.fsPath}`
-          );
-        }
-        return;
-      }
-      // 跨平台注册表仲裁：登记为 UTF 族（最近某平台修复/切换成 UTF）→
-      // 与磁盘一致，接受现状并同步本地历史——否则两个平台各按自己的
-      // lastEnc 反向回滚，连续抢注转码直到熔断
-      const reg = readEncReg(uri.fsPath);
-      if (reg && isUtfFamily(reg.enc)) {
-        setLastEnc(uri.toString(), enc);
-        L(
-          `跨平台登记为 ${reg.enc}（${reg.platform}），与磁盘一致，接受现状：${uri.fsPath}`
-        );
-        return;
-      }
-      // 内容声明与回滚目标冲突（如 XML 声明 utf-8、历史是 GBK）→ 声明优先：
-      // 文件当前已是声明编码（自洽），"迁移"实为 AI/工具的有意转换，不回滚
-      if (declared && isUtfFamily(declared)) {
-        L(
-          `内容声明 ${declared} 与当前一致，接受现状不做迁移回滚：${uri.fsPath}`
-        );
-        return;
-      }
-      // 回滚目标以注册表为准（跨平台共识比本平台历史更新）；无登记才用 prev
-      const target = reg && !isUtfFamily(reg.enc) ? reg.enc : prev;
-      const converted = migrateEncodingBytes(full, enc, target);
-      if (converted) {
-        await tryRepairMigrated(uri, full, converted, target, enc);
-      } else {
-        L(`疑似编码迁移但无法无损转回 ${target}（含不可表达字符），放弃：${uri.fsPath}`);
-      }
-    }
+    // 无损全量编码变化一律接受现状（0.10.13）：全文合法且含中文、仅编码族
+    // 整体改变（GBK→UTF-8 或反向）时，无论写入者是用户还是 AI/工具，只要
+    // 转换无损就不再回滚——回滚与用户意图打架的损害远大于收益（hmiview.cpp
+    // 状态栏转 UTF-8 被两次转回 GBK）。有损写入已在上方走混合/双重转码修复；
+    // 磁盘违背内容声明的场景由上方声明优先闸门处理，无需在此重复
     return;
   }
 
@@ -2137,53 +2092,8 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
     await tryRepairCorrupted(uri, full);
     return;
   }
-  if (
-    prev &&
-    prev !== "unknown" &&
-    isUtfFamily(prev) &&
-    hasStrongCJK(decodeWith(enc, full) ?? "")
-  ) {
-    // 内容声明与当前编码同族（如 XML 声明 GB2312、磁盘 GBK）→ 自洽，
-    // 接受现状并同步本地历史——声明优先于注册表与历史（hmipermit.xml 战争根因）
-    const declared = declaredEncoding(head);
-    if (declared && !isUtfFamily(declared) && isGbkLike(declared) === isGbkLike(enc)) {
-      setLastEnc(uri.toString(), enc);
-      L(
-        `内容声明 ${declared} 与当前编码一致，接受现状不做迁移回滚：${uri.fsPath}`
-      );
-      return;
-    }
-    // 跨平台注册表仲裁：登记为非 UTF 族（最近某平台确认是 GBK 等）→ 与
-    // 磁盘一致，接受现状并同步本地历史，防止与其它平台方向相反的拉锯
-    const reg = readEncReg(uri.fsPath);
-    if (reg && !isUtfFamily(reg.enc)) {
-      setLastEnc(uri.toString(), enc);
-      L(
-        `跨平台登记为 ${reg.enc}（${reg.platform}），与磁盘一致，接受现状：${uri.fsPath}`
-      );
-      return;
-    }
-    // 磁盘编码违背内容声明（如 XML 声明 utf-8、磁盘却是 GBK）→ 以声明为
-    // 修复目标（工具链按声明解码，声明优先于注册表与历史编码记录）；无声明
-    // 时按注册表（跨平台共识），最后才是 utf8
-    const target =
-      declared
-        ? declared
-        : reg && isUtfFamily(reg.enc)
-          ? reg.enc
-          : "utf8";
-    if (declared) {
-      L(
-        `磁盘编码 ${enc} 违背内容声明 ${declared}，按声明编码修复：${uri.fsPath}`
-      );
-    }
-    const converted = migrateEncodingBytes(full, enc, target);
-    if (converted) {
-      await tryRepairMigrated(uri, full, converted, target, enc);
-    } else {
-      L(`疑似编码迁移但无法无损转回 ${target}（含不可表达字符），放弃：${uri.fsPath}`);
-    }
-  }
+  // 无损全量编码变化一律接受现状（0.10.13），理由同 UTF 分支；lastEnc 已
+  // 在前面统一同步为当前编码，后续事件不会重复触发任何回滚
 }
 
 // ===== AI 新建文件的初始编码归一 =====
