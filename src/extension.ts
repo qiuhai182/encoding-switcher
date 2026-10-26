@@ -68,17 +68,66 @@ function findByUri(uri: vscode.Uri): vscode.TextDocument | undefined {
   );
 }
 
+// 诊断：统计文本特征，日志里逐项写清楚，便于判断中文是否被写坏
+function summarizeText(text: string): string {
+  let chineseCount = 0;
+  let questionCount = 0;
+  let replacementCount = 0;
+  for (const oneChar of text) {
+    const codePoint = oneChar.codePointAt(0) ?? 0;
+    if (codePoint >= 0x4e00 && codePoint <= 0x9fff) {
+      chineseCount++;
+    } else if (oneChar === "?") {
+      questionCount++;
+    } else if (oneChar === "\ufffd") {
+      replacementCount++;
+    }
+  }
+  const lineCount = text.split(/\r\n|\r|\n/).length;
+  return (
+    `字符数=${text.length} 行数=${lineCount} 中文字数=${chineseCount} ` +
+    `问号数=${questionCount} 替换字符数=${replacementCount}`
+  );
+}
+
+// 诊断：统计磁盘字节的编码与内容特征
+function summarizeBytes(bytesToCheck: Buffer): string {
+  const detectedEncoding = detectEncoding(bytesToCheck, getDetectionEncodings());
+  const text =
+    detectedEncoding === "unknown"
+      ? bytesToCheck.toString("utf8")
+      : iconv.decode(bytesToCheck, detectedEncoding);
+  return (
+    `字节数=${bytesToCheck.length} 检测编码=${detectedEncoding} ` +
+    summarizeText(text)
+  );
+}
+
+// 诊断：记录磁盘文件当前状态；读取失败也明确记录，不静默跳过
+function logDiskState(tag: string, filePath: string): void {
+  try {
+    L(`${tag}：${filePath} ${summarizeBytes(fs.readFileSync(filePath))}`);
+  } catch (e) {
+    L(`${tag}（读取失败：${String(e)}）：${filePath}`);
+  }
+}
+
 // 将字符串以指定编码写回文件（Node Buffer 不支持 gbk/gb2312，统一用 iconv-lite）
+// 每次写盘都记录写前文本特征与写后磁盘状态，保证“每一次修改都有日志”
 function writeFileWithEncoding(
   filePath: string,
   text: string,
-  encoding: string
+  encoding: string,
+  source = "编码写入"
 ): boolean {
+  L(`写盘前[${source}]：${filePath} 目标编码=${encoding} ${summarizeText(text)}`);
   try {
     const buf = iconv.encode(text, encoding);
     fs.writeFileSync(filePath, buf);
+    logDiskState(`写盘后[${source}]`, filePath);
     return true;
-  } catch {
+  } catch (e) {
+    L(`写盘失败[${source}]：${filePath} 原因=${String(e)}`);
     return false;
   }
 }
@@ -308,6 +357,11 @@ async function applyEncodingOverride(
       oldEnc: encInspect ? encInspect[scopeKey] : undefined,
       oldGuess: guessInspect ? guessInspect[scopeKey] : undefined,
     };
+    L(
+      `应用编码覆盖：${uri.fsPath} 作用域=${scope === vscode.ConfigurationTarget.Workspace ? "工作区" : "用户"} ` +
+        `编码=${vscodeEncodingLabel(encLabel).toLowerCase()}（原值=${String(ov.oldEnc)}） ` +
+        `自动猜测编码=false（原值=${String(ov.oldGuess)}）`
+    );
     await filesCfg.update(
       "encoding",
       vscodeEncodingLabel(encLabel).toLowerCase(),
@@ -322,11 +376,16 @@ async function applyEncodingOverride(
 }
 
 async function restoreEncodingOverride(ov: EncodingOverride): Promise<void> {
+  L(
+    `恢复编码覆盖：作用域=${ov.scope === vscode.ConfigurationTarget.Workspace ? "工作区" : "用户"} ` +
+      `编码=${String(ov.oldEnc)} 自动猜测编码=${String(ov.oldGuess)}`
+  );
   try {
     await ov.filesCfg.update("encoding", ov.oldEnc, ov.scope);
     await ov.filesCfg.update("autoGuessEncoding", ov.oldGuess, ov.scope);
-  } catch {
-    // 恢复失败不阻断（值仅短暂变更，下次用户改动设置会覆盖）
+  } catch (e) {
+    // 恢复失败不阻断（值仅短暂变更，下次用户改动设置会覆盖），但必须留痕
+    L(`恢复编码覆盖失败：原因=${String(e)}`);
   }
 }
 
@@ -413,6 +472,7 @@ class EncodingViewProvider implements vscode.FileSystemProvider {
     const fsPath = this.toFsPath(uri);
     const openEnc = this.encOf(uri);
     const text = Buffer.from(content).toString("utf-8");
+    L(`编码视图保存前：${fsPath} 打开时编码=${openEnc} ${summarizeText(text)}`);
     // 写回前检测文件当前实际编码，写回编码跟随实际编码而非打开时的固定编码；
     // 实际编码与打开时不一致（被外部改写）则阻止保存，防止覆盖外部修改
     let curEnc = openEnc;
@@ -453,7 +513,9 @@ class EncodingViewProvider implements vscode.FileSystemProvider {
         });
       throw vscode.FileSystemError.NoPermissions(msg);
     }
+    L(`编码视图保存：${fsPath} 写入编码=${curEnc}`);
     fs.writeFileSync(fsPath, iconv.encode(text, curEnc));
+    logDiskState("编码视图保存后", fsPath);
   }
 
   readDirectory(): [] {
@@ -473,6 +535,7 @@ class EncodingViewProvider implements vscode.FileSystemProvider {
   }
 
   async open(fsPath: string, encLabel: string): Promise<void> {
+    L(`打开编码视图：${fsPath} 编码=${encLabel}`);
     const viewUri = vscode.Uri.parse(
       `${VIEW_SCHEME}://${encLabel}/${encodeURIComponent(fsPath)}`
     );
@@ -614,6 +677,9 @@ async function reopenDisplayedCorrectly(
     L(`无需重开：${uri.fsPath} 内容为空`);
     return true;
   }
+  L(
+    `重开流程开始：${uri.fsPath} 目标编码=${encLabel} 期望内容=${summarizeText(expectedText)}`
+  );
 
   // 轮询等待：重开是异步的，需等新模型就绪；内容与预期一致才算成功
   const displayedOK = async (maxPolls: number): Promise<boolean> => {
@@ -680,6 +746,9 @@ async function reopenDisplayedCorrectly(
         if (d.uri.toString() !== uri.toString()) {
           continue;
         }
+        L(
+          `关闭编辑器前：${uri.fsPath} 文档编码标签=${d.encoding} 有未保存修改=${d.isDirty} ${summarizeText(d.getText())}`
+        );
         try {
           await vscode.window.showTextDocument(d, { preview: false });
           await vscode.commands.executeCommand("workbench.action.closeActiveEditor");
@@ -714,6 +783,9 @@ async function reopenDisplayedCorrectly(
         markInternalReopen(uri); // 重开会重建文档模型，标记为内部事件
         const nd = await vscode.workspace.openTextDocument(uri);
         await vscode.window.showTextDocument(nd, { preview: false });
+        L(
+          `重开后文档：${uri.fsPath} 文档编码标签=${nd.encoding} ${summarizeText(nd.getText())}`
+        );
         reopened = true;
       } catch (e) {
         L(`重开异常（第${attempt}次）: ${String(e)}`);
@@ -869,7 +941,10 @@ async function convertTo(targetEnc: string, targetLabel: string): Promise<void> 
   //    变化事件，把这次切换误判为 AI 改写而回滚成旧编码——即"第一次转换
   //    没生效"的根源。claim 读取无同步延迟，回滚钩子见到即让路。
   forceClaim(filePath, targetEnc, "claimed");
-  if (!writeFileWithEncoding(filePath, text, targetEnc)) {
+  L(
+    `转换保存：${filePath} 原编码=${srcEnc} 目标编码=${targetEnc} 原始磁盘状态=${summarizeBytes(bytes)}`
+  );
+  if (!writeFileWithEncoding(filePath, text, targetEnc, "转换保存")) {
     vscode.window.showErrorMessage(`切换为 ${targetLabel} 失败`);
     return;
   }
@@ -945,7 +1020,7 @@ async function convertTo(targetEnc: string, targetLabel: string): Promise<void> 
         `终验发现文件被回滚为 ${finalEnc}（应为 ${targetEnc}），重新写入覆盖：${filePath}`
       );
       forceClaim(filePath, targetEnc, "claimed");
-      writeFileWithEncoding(filePath, text, targetEnc);
+      writeFileWithEncoding(filePath, text, targetEnc, "转换终验重写");
     }
     finishClaim(filePath, targetEnc);
     // 指纹按（可能重写后的）最新磁盘状态刷新，避免自动检测重复干预
@@ -1603,12 +1678,18 @@ async function executeRepairInner(
   // 备份 + 原子替换
   const backupPath = uri.fsPath + ".bak";
   const tmpPath = uri.fsPath + ".encoding-guard.tmp";
+  L(
+    `修复写盘前：${uri.fsPath} 修复类型=${result.kind} 目标编码=${result.encoding} ` +
+      `原磁盘=${summarizeBytes(detectedBytes)} 修复后=${summarizeBytes(result.bytes)} ` +
+      `备份=${isRepairBackup() ? "启用" : "关闭"}`
+  );
   try {
     if (isRepairBackup()) {
       fs.writeFileSync(backupPath, detectedBytes);
     }
     fs.writeFileSync(tmpPath, result.bytes);
     fs.renameSync(tmpPath, uri.fsPath);
+    logDiskState("修复写盘后", uri.fsPath);
   } catch (e) {
     L(`修复写盘失败: ${String(e)}`);
     try {
@@ -2484,7 +2565,12 @@ function normalizeNewFileEncoding(uri: vscode.Uri): void {
       );
       return;
     }
+    L(
+      `新文件归一写盘前：${uri.fsPath} 原编码=${actual} 目标编码=${defEnc} ` +
+        `原内容=${summarizeText(text)} 目标字节数=${converted.length}`
+    );
     fs.writeFileSync(uri.fsPath, converted);
+    logDiskState("新文件归一写盘后", uri.fsPath);
     finishClaim(uri.fsPath, defEnc);
     setLastEnc(key, defEnc);
     writeEncReg(uri.fsPath, defEnc); // 跨平台登记（方向仲裁依据）
