@@ -908,6 +908,9 @@ async function convertTo(targetEnc: string, targetLabel: string): Promise<void> 
 
   const filePath = doc.uri.fsPath;
 
+  // 用户显式发起转换：解除之前的放弃标记，允许再尝试一次
+  clearGiveUp(doc.uri);
+
   // 1) 检测文件真实编码
   let bytes: Buffer;
   try {
@@ -945,9 +948,21 @@ async function convertTo(targetEnc: string, targetLabel: string): Promise<void> 
     `转换保存：${filePath} 原编码=${srcEnc} 目标编码=${targetEnc} 原始磁盘状态=${summarizeBytes(bytes)}`
   );
   if (!writeFileWithEncoding(filePath, text, targetEnc, "转换保存")) {
-    vscode.window.showErrorMessage(`切换为 ${targetLabel} 失败`);
+    markGiveUp(doc.uri, "转换写盘失败");
+    notifyGiveUp(doc.uri, "编码转换", "写盘失败", "磁盘原文件未被改动");
     return;
   }
+  // 单次尝试：写盘一次后立即回读校验，不通过就还原原始字节并放弃，
+  // 绝不再写第二次（反复改写会把中文写成 ?，不可逆）
+  const convCheck = verifyWrittenText(filePath, text, targetEnc);
+  if (!convCheck.ok) {
+    L(`转换校验未通过：${filePath} ${convCheck.detail}`);
+    markGiveUp(doc.uri, "转换校验未通过");
+    restoreOriginalBytes(filePath, bytes, "转换校验未通过");
+    notifyGiveUp(doc.uri, "编码转换", "写盘内容与预期不一致");
+    return;
+  }
+  L(`转换校验通过：${filePath} 目标编码=${targetEnc}`);
 
   // 转换成功后记录新指纹，避免自动检测重复干预；
   // 同步监督状态，防止 watcher 把用户主动转换误判为外部编码损坏；
@@ -972,6 +987,8 @@ async function convertTo(targetEnc: string, targetLabel: string): Promise<void> 
     ok = false;
   }
   if (!ok) {
+    // 磁盘内容已校验通过，只是视图没刷新：不再反复关闭重开，交由用户手动重开
+    markGiveUp(doc.uri, "转换后重开显示未刷新");
     notifyWithOpenFile(
       "warn",
       `已转换为 ${targetLabel} 并保存到磁盘，但视图未能自动刷新为新编码。请手动关闭该文件后重新打开。可到输出面板「编码切换器」查看诊断日志。`,
@@ -1016,14 +1033,22 @@ async function convertTo(targetEnc: string, targetLabel: string): Promise<void> 
     const finalOk =
       finUtf === tgtUtf && (tgtUtf || finalEnc === targetEnc);
     if (!finalOk) {
+      // 单次原则：磁盘已被其它实例/程序改回，不再第二次写盘覆盖。
+      // 继续抢写只会在两个写入者之间来回改写，最终把中文写成 ?。
       L(
-        `终验发现文件被回滚为 ${finalEnc}（应为 ${targetEnc}），重新写入覆盖：${filePath}`
+        `终验发现磁盘已变为 ${finalEnc}（应为 ${targetEnc}），按单次原则不再重写：${filePath}`
       );
-      forceClaim(filePath, targetEnc, "claimed");
-      writeFileWithEncoding(filePath, text, targetEnc, "转换终验重写");
+      markGiveUp(doc.uri, `终验磁盘编码=${finalEnc}`);
+      notifyGiveUp(
+        doc.uri,
+        "编码转换",
+        `保存后磁盘又被改为 ${finalEnc.toUpperCase()}`,
+        "磁盘保持当前内容未再改写"
+      );
+      return;
     }
     finishClaim(filePath, targetEnc);
-    // 指纹按（可能重写后的）最新磁盘状态刷新，避免自动检测重复干预
+    // 指纹按最新磁盘状态刷新，避免自动检测重复干预
     const fpFinal = diskFingerprint(doc.uri);
     autoDone.set(doc.uri.toString(), fpFinal);
     watcherDone.set(doc.uri.toString(), fpFinal);
@@ -1175,6 +1200,10 @@ function scheduleAutoReopen(uri: vscode.Uri, verifyAll = false): void {
     }
     await sleep(250); // 等待打开事件尘埃落定
     const key = uri.toString();
+    if (isGiveUp(uri)) {
+      L(`已放弃自动处理，跳过重开：${uri.fsPath}`);
+      return;
+    }
     const fp = diskFingerprint(uri);
     if (autoDone.get(key) === fp) {
       return; // 已处理过且文件未变化
@@ -1492,6 +1521,89 @@ function notifyWithOpenFile(
   });
 }
 
+// ===== 单次尝试原则：转换/修复一次未通过校验，立即还原并放弃 =====
+// 反复自动改写同一文件是把中文写成 ?（不可逆）的主要风险来源。
+// 因此每个文件在一次尝试后无论何种原因未通过校验，都把原始字节还原，
+// 并在本次会话内不再自动处理该文件，弹窗交由用户手动指定编码。
+const giveUpFiles = new Map<string, string>(); // uri → 放弃原因（仅用于日志）
+
+function isGiveUp(uri: vscode.Uri): boolean {
+  return giveUpFiles.has(uri.toString());
+}
+
+function markGiveUp(uri: vscode.Uri, reason: string): void {
+  giveUpFiles.set(uri.toString(), reason);
+  watcherDone.set(uri.toString(), diskFingerprint(uri));
+  L(`已放弃自动处理（本次会话不再尝试）：${uri.fsPath} 原因=${reason}`);
+}
+
+function clearGiveUp(uri: vscode.Uri): void {
+  if (giveUpFiles.delete(uri.toString())) {
+    L(`用户手动发起转换，解除放弃标记：${uri.fsPath}`);
+  }
+}
+
+// 还原原始字节：先写临时文件再原子替换，避免中途失败留下半截文件
+function restoreOriginalBytes(
+  filePath: string,
+  original: Buffer,
+  tag: string
+): boolean {
+  const tmpPath = filePath + ".encoding-guard.restore.tmp";
+  try {
+    fs.writeFileSync(tmpPath, original);
+    fs.renameSync(tmpPath, filePath);
+    logDiskState(`已还原原始字节[${tag}]`, filePath);
+    return true;
+  } catch (e) {
+    L(`还原原始字节失败[${tag}]：${filePath} 原因=${String(e)}`);
+    try {
+      fs.unlinkSync(tmpPath);
+    } catch {
+      // 忽略
+    }
+    return false;
+  }
+}
+
+// 写盘后只校验、不重写：回读磁盘，按目标编码解码必须与期望文本完全一致
+function verifyWrittenText(
+  filePath: string,
+  expectedText: string,
+  encoding: string
+): { ok: boolean; detail: string } {
+  let written: Buffer;
+  try {
+    written = fs.readFileSync(filePath);
+  } catch (e) {
+    return { ok: false, detail: `回读磁盘失败：${String(e)}` };
+  }
+  const backText = isUtfFamily(encoding)
+    ? written.toString("utf8")
+    : iconv.decode(written, encoding);
+  const expected = normalizeText(expectedText);
+  const actual = normalizeText(backText);
+  const detail =
+    `期望=${summarizeText(expectedText)} 回读=${summarizeBytes(written)}`;
+  return { ok: actual === expected, detail };
+}
+
+// 放弃后统一弹窗：说明已还原、不再自动处理、交由用户手动指定编码
+function notifyGiveUp(
+  uri: vscode.Uri,
+  action: string,
+  reason: string,
+  resultNote = "已还原为转换前的原始内容"
+): void {
+  const name = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
+  notifyWithOpenFile(
+    "warn",
+    `编码守护：${name} 的${action}未通过校验（${reason}），${resultNote}。` +
+      `为防止反复自动改写损坏文件，本文件本次会话内不再自动处理，请手动指定正确编码后再保存。`,
+    uri
+  );
+}
+
 function warnCorrupted(uri: vscode.Uri, hint?: string): void {
   const name = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
   L(`疑似编码损坏：${uri.fsPath}`);
@@ -1538,7 +1650,10 @@ interface MigrateState {
   time: number;
 }
 const migrateStates = new Map<string, MigrateState>();
-const MIGRATE_STRIKES = 3;
+// 单次尝试：一次回滚后又被打回原编码，即停止重写，弹窗交由用户处理
+const MIGRATE_STRIKES = 1;
+// 放弃（未写盘）不算尝试次数，单独按 3 次熔断提示
+const ABANDON_STRIKES = 3;
 const MIGRATE_WINDOW_MS = 3 * 60 * 1000;
 
 // 修复静默放弃计数：文件持续变化/编辑器未保存修改导致修复反复放弃时，
@@ -1555,10 +1670,10 @@ function noteRepairAbandon(uri: vscode.Uri, advice: string): void {
   }
   st.count++;
   st.time = now;
-  if (st.count === MIGRATE_STRIKES) {
+  if (st.count === ABANDON_STRIKES) {
     repairAbandons.delete(key);
     warnWithOpenFile(
-      `编码守护连续 ${MIGRATE_STRIKES} 次放弃修复：${advice}`,
+      `编码守护连续 ${ABANDON_STRIKES} 次放弃修复：${advice}`,
       uri
     );
   }
@@ -1631,6 +1746,10 @@ async function executeRepairInner(
   result: RepairResult
 ): Promise<boolean> {
   const key = uri.toString();
+  if (isGiveUp(uri)) {
+    L(`已放弃自动处理，跳过修复：${uri.fsPath}`);
+    return true;
+  }
   const name = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
   const ext = fileExt(uri.fsPath);
   const quiet = ext === "log"; // 日志文件通知降级：只记日志不弹窗
@@ -1690,6 +1809,29 @@ async function executeRepairInner(
     fs.writeFileSync(tmpPath, result.bytes);
     fs.renameSync(tmpPath, uri.fsPath);
     logDiskState("修复写盘后", uri.fsPath);
+    // 单次尝试：回读磁盘必须与修复结果字节完全一致；
+    // 不一致立即还原原始字节并放弃，绝不进行第二次修复
+    let repaired: Buffer | null = null;
+    try {
+      repaired = fs.readFileSync(uri.fsPath);
+    } catch {
+      // 回读失败按校验不通过处理
+    }
+    if (!repaired || !repaired.equals(result.bytes)) {
+      L(
+        `修复校验未通过：${uri.fsPath} 期望=${summarizeBytes(result.bytes)} ` +
+          `回读=${repaired ? summarizeBytes(repaired) : "读取失败"}`
+      );
+      restoreOriginalBytes(uri.fsPath, detectedBytes, "修复校验未通过");
+      try {
+        fs.unlinkSync(backupPath);
+      } catch {
+        // 忽略
+      }
+      markGiveUp(uri, "修复校验未通过");
+      notifyGiveUp(uri, "编码修复", "写盘内容与预期不一致");
+      return true;
+    }
   } catch (e) {
     L(`修复写盘失败: ${String(e)}`);
     try {
@@ -1702,7 +1844,8 @@ async function executeRepairInner(
     } catch {
       // 忽略
     }
-    warnCorrupted(uri);
+    markGiveUp(uri, "修复写盘失败");
+    notifyGiveUp(uri, "编码修复", "写盘失败", "磁盘原文件未被改动");
     return true;
   }
   // 修复成功：删除备份，登记状态
@@ -1749,6 +1892,10 @@ async function executeRepairInner(
 // 检测并修复：全文分析 → 可逆修复；不可逆/不安全 → 告警
 async function tryRepairCorrupted(uri: vscode.Uri, full: Buffer): Promise<void> {
   const key = uri.toString();
+  if (isGiveUp(uri)) {
+    L(`已放弃自动处理，跳过损坏修复检测：${uri.fsPath}`);
+    return;
+  }
   if (repairing.has(key)) {
     // 同一文件修复进行中，不并发；重排队等待下一次检查
     scheduleWatchCheck(uri);
@@ -1793,6 +1940,10 @@ async function tryRepairMigrated(
   currentEnc: string
 ): Promise<void> {
   const key = uri.toString();
+  if (isGiveUp(uri)) {
+    L(`已放弃自动处理，跳过迁移回滚：${uri.fsPath}`);
+    return;
+  }
   if (repairing.has(key)) {
     scheduleWatchCheck(uri); // 修复进行中，重排队
     return;
@@ -1840,6 +1991,7 @@ async function tryRepairMigrated(
   const ms = migrateStates.get(key);
   if (ms && Date.now() - ms.time < MIGRATE_WINDOW_MS && ms.count >= MIGRATE_STRIKES) {
     migrateStates.delete(key);
+    markGiveUp(uri, "迁移回滚结果被外部程序反复写回");
     L(
       `迁移回滚达 ${MIGRATE_STRIKES} 次仍被写坏，停止重写字节，改为纠正标签页编码：${uri.fsPath}`
     );
@@ -1960,6 +2112,10 @@ function sameEncFamily(a: string, b: string): boolean {
 async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
   const key = uri.toString();
   let fp = diskFingerprint(uri);
+  if (isGiveUp(uri)) {
+    watcherDone.set(key, fp); // 已放弃：登记指纹，避免每个写入事件重复进入
+    return;
+  }
 
   // Diff 审核中静默：待确认状态下不动字节（修复/归一会与撤销回滚竞态），
   // diff 关闭后由 onDidChangeTabs 监听补做本次校验
@@ -1977,12 +2133,14 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
       return; // 修复写盘自身触发的事件
     }
     if (fp === rs.badFp) {
-      if (rs.count >= 3) {
-        // 已自动修复 3 次仍被写回旧乱码：AI 在用它内存里的旧快照覆盖，
+      if (rs.count >= 1) {
+        // 单次尝试：修复一次后又被打回旧乱码，说明写入者在用旧快照覆盖，
+        // 继续抢写只会反复改写（可能把中文写成 ?），停止并交由用户处理
         // 插件无法阻止其写入（文件系统无锁可用），停止对抗并明确告知
         const name = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
         L(`回写对抗达上限（已修复 ${rs.count} 次），停止自动修复：${uri.fsPath}`);
         repairStates.delete(key);
+        markGiveUp(uri, "修复结果被外部程序反复回写");
         watcherDone.set(key, fp);
         warnWithOpenFile(
           `${name} 的编码损坏已被自动修复 ${rs.count} 次，但又被外部程序（可能是 AI）用旧内容覆盖。` +
@@ -2482,6 +2640,9 @@ const witnessedNewFiles = new Set<string>();
 // 新文件落盘 → 按本平台 files.encoding 归一编码（无损转换，失败不动文件）
 function normalizeNewFileEncoding(uri: vscode.Uri): void {
   const key = uri.toString();
+  if (isGiveUp(uri)) {
+    return; // 已放弃自动处理：不再做任何字节归一
+  }
   if (normalizePending.has(key) || !shouldWatchFile(uri)) {
     return;
   }
@@ -2571,6 +2732,23 @@ function normalizeNewFileEncoding(uri: vscode.Uri): void {
     );
     fs.writeFileSync(uri.fsPath, converted);
     logDiskState("新文件归一写盘后", uri.fsPath);
+    // 单次尝试：回读必须与转码结果完全一致，不一致还原原始字节并放弃
+    let normalizedBack: Buffer | null = null;
+    try {
+      normalizedBack = fs.readFileSync(uri.fsPath);
+    } catch {
+      // 读取失败按校验不通过处理
+    }
+    if (!normalizedBack || !normalizedBack.equals(converted)) {
+      L(
+        `新文件归一校验未通过：${uri.fsPath} 目标编码=${defEnc} ` +
+          `回读=${normalizedBack ? summarizeBytes(normalizedBack) : "读取失败"}`
+      );
+      restoreOriginalBytes(uri.fsPath, bytes, "新文件归一校验未通过");
+      markGiveUp(uri, "新文件归一校验未通过");
+      notifyGiveUp(uri, "新文件编码归一", "写盘内容与预期不一致");
+      return;
+    }
     finishClaim(uri.fsPath, defEnc);
     setLastEnc(key, defEnc);
     writeEncReg(uri.fsPath, defEnc); // 跨平台登记（方向仲裁依据）
