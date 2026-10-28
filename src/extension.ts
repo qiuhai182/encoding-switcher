@@ -1173,24 +1173,91 @@ function enqueueAuto(task: () => Promise<void>): void {
 const reopenCooldown = new Map<string, number>();
 const REOPEN_COOLDOWN_MS = 10 * 60 * 1000;
 
-// Diff 审核视图检测：AI（SOLO/Agent）改完文件停在「变更已完成，请确认是否
-// 采纳」时，文件会以 diff 编辑器形式展示。审核期间磁盘处于待定状态（采纳
-// 或撤销均可能）：重开会打断审核，字节修复/归一会与撤销回滚竞态写坏文件
-// （同 mainframe.cpp 事故成因）。此时校验必须静默；diff 关闭后由
-// onDidChangeTabs 监听补做校验，修复链一条不少，只是推迟到内容定稿之后
-function findDiffReviewTab(fsPath: string): vscode.Tab | undefined {
-  const norm = fsPath.replace(/\\/g, "/").toLowerCase();
-  return vscode.window.tabGroups.all
-    .flatMap((g) => g.tabs)
-    .find(
-      (t) =>
-        t.input instanceof vscode.TabInputTextDiff &&
-        (t.input.modified.fsPath.replace(/\\/g, "/").toLowerCase() === norm ||
-          t.input.original.fsPath.replace(/\\/g, "/").toLowerCase() === norm)
-    );
+// AI 审核视图检测：AI（SOLO/Agent）改完文件停在「变更已完成，请确认是否
+// 采纳/保留/撤销」时，磁盘内容处于待定状态：重开会打断审核，字节修复/归一
+// 会与撤销回滚竞态写坏文件。此时必须不重开、不转码。
+// 检测两类视图：
+// 1) 内核原生 diff 编辑器（TabInputTextDiff，原/改两侧都匹配文件路径）
+// 2) 扩展自定义的审核视图/Webview 标签：input 无法统一取值，按「标签文本含
+//    审核关键字 + 路径或文件名匹配」判定；命中时把标签信息写进日志便于核对
+const REVIEW_LABEL_HINTS = [
+  "diff",
+  "更改",
+  "变更",
+  "review",
+  "待确认",
+  "采纳",
+  "撤销",
+  "保留",
+];
+
+function tabInputPaths(input: unknown): string[] {
+  const paths: string[] = [];
+  if (!input || typeof input !== "object") {
+    return paths;
+  }
+  const obj = input as Record<string, unknown>;
+  for (const field of ["uri", "original", "modified", "fileUri", "resource"]) {
+    const v = obj[field];
+    if (v && typeof v === "object" && typeof (v as vscode.Uri).fsPath === "string") {
+      paths.push((v as vscode.Uri).fsPath);
+    }
+  }
+  return paths;
 }
 
-function scheduleAutoReopen(uri: vscode.Uri, verifyAll = false): void {
+function findDiffReviewTab(fsPath: string): vscode.Tab | undefined {
+  const norm = fsPath.replace(/\\/g, "/").toLowerCase();
+  const baseName = (fsPath.split(/[\\/]/).pop() ?? "").toLowerCase();
+  for (const group of vscode.window.tabGroups.all) {
+    for (const t of group.tabs) {
+      if (t.input instanceof vscode.TabInputTextDiff) {
+        const m = t.input.modified.fsPath.replace(/\\/g, "/").toLowerCase();
+        const o = t.input.original.fsPath.replace(/\\/g, "/").toLowerCase();
+        if (m === norm || o === norm) {
+          return t;
+        }
+        continue;
+      }
+      const paths = tabInputPaths(t.input);
+      const pathMatch = paths.some(
+        (p) => p.replace(/\\/g, "/").toLowerCase() === norm
+      );
+      const label = t.label.toLowerCase();
+      const hint = REVIEW_LABEL_HINTS.some((h) => label.includes(h));
+      const nameMatch = baseName.length > 0 && label.includes(baseName);
+      if (hint && (pathMatch || nameMatch)) {
+        return t;
+      }
+    }
+  }
+  return undefined;
+}
+
+// 标签栏中是否已有该文件的文本编辑器标签。
+// 规则：标签早就存在 → 不重开、不转码（即使编码显示不正确）。
+// 只有「新打开文件/新建标签」这一次打开事件才允许按正确编码尝试重开。
+function isFileOpenInTab(fsPath: string): boolean {
+  const norm = fsPath.replace(/\\/g, "/").toLowerCase();
+  for (const group of vscode.window.tabGroups.all) {
+    for (const t of group.tabs) {
+      if (
+        t.input instanceof vscode.TabInputText &&
+        t.input.uri.scheme === "file" &&
+        t.input.uri.fsPath.replace(/\\/g, "/").toLowerCase() === norm
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function scheduleAutoReopen(
+  uri: vscode.Uri,
+  verifyAll = false,
+  allowExistingTab = false
+): void {
   enqueueAuto(async () => {
     // 日志类文件被程序持续追加，“全文比对”校验必然与追加竞态失败，
     // 因此跳过外部改写校验（verifyAll=true）；
@@ -1204,6 +1271,12 @@ function scheduleAutoReopen(uri: vscode.Uri, verifyAll = false): void {
       L(`已放弃自动处理，跳过重开：${uri.fsPath}`);
       return;
     }
+    // 标签早就存在时不重开（即使编码显示不正确）：只有新打开文件/新建标签
+    // 的这一次打开事件才允许按正确编码尝试重开
+    if (!allowExistingTab && isFileOpenInTab(uri.fsPath)) {
+      L(`标签已存在，不重开（仅新打开标签时才纠正编码）：${uri.fsPath}`);
+      return;
+    }
     const fp = diskFingerprint(uri);
     if (autoDone.get(key) === fp) {
       return; // 已处理过且文件未变化
@@ -1212,9 +1285,12 @@ function scheduleAutoReopen(uri: vscode.Uri, verifyAll = false): void {
     if (until && Date.now() < until) {
       return; // 冷却期内不重试
     }
-    // Diff 审核中静默：待确认状态下不重开/不修复，diff 关闭后补校验
-    if (findDiffReviewTab(uri.fsPath)) {
-      L(`审核中静默（diff 待确认，关闭后自动补校验）：${uri.fsPath}`);
+    // AI 审核未确认（保留/撤销）期间静默：不重开、不修复
+    const reviewTab = findDiffReviewTab(uri.fsPath);
+    if (reviewTab) {
+      L(
+        `审核中静默（待确认，不重开）：${uri.fsPath} 命中标签=${reviewTab.label}`
+      );
       return;
     }
     const d = findByUri(uri);
@@ -1896,6 +1972,11 @@ async function tryRepairCorrupted(uri: vscode.Uri, full: Buffer): Promise<void> 
     L(`已放弃自动处理，跳过损坏修复检测：${uri.fsPath}`);
     return;
   }
+  // 标签已存在的文件不转码（即使编码显示不正确）：只允许新打开标签时纠正
+  if (isFileOpenInTab(uri.fsPath)) {
+    L(`标签已存在，不转码（仅新打开标签时才纠正编码）：${uri.fsPath}`);
+    return;
+  }
   if (repairing.has(key)) {
     // 同一文件修复进行中，不并发；重排队等待下一次检查
     scheduleWatchCheck(uri);
@@ -1942,6 +2023,11 @@ async function tryRepairMigrated(
   const key = uri.toString();
   if (isGiveUp(uri)) {
     L(`已放弃自动处理，跳过迁移回滚：${uri.fsPath}`);
+    return;
+  }
+  // 标签已存在的文件不转码（即使编码显示不正确）
+  if (isFileOpenInTab(uri.fsPath)) {
+    L(`标签已存在，不转码（仅新打开标签时才纠正编码）：${uri.fsPath}`);
     return;
   }
   if (repairing.has(key)) {
@@ -2117,10 +2203,10 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
     return;
   }
 
-  // Diff 审核中静默：待确认状态下不动字节（修复/归一会与撤销回滚竞态），
-  // diff 关闭后由 onDidChangeTabs 监听补做本次校验
-  if (findDiffReviewTab(uri.fsPath)) {
-    L(`审核中静默（diff 待确认，关闭后自动补校验）：${uri.fsPath}`);
+  // AI 审核未确认（保留/撤销）期间不动字节（与撤销回滚竞态会写坏文件）
+  const reviewTab = findDiffReviewTab(uri.fsPath);
+  if (reviewTab) {
+    L(`审核中静默（待确认，不转码）：${uri.fsPath} 命中标签=${reviewTab.label}`);
     return;
   }
 
@@ -2643,6 +2729,17 @@ function normalizeNewFileEncoding(uri: vscode.Uri): void {
   if (isGiveUp(uri)) {
     return; // 已放弃自动处理：不再做任何字节归一
   }
+  // 标签已存在的文件不转码（即使编码显示不正确）
+  if (isFileOpenInTab(uri.fsPath)) {
+    L(`标签已存在，不转码（仅新打开标签时才纠正编码）：${uri.fsPath}`);
+    return;
+  }
+  // AI 审核未确认（保留/撤销）期间不转码，等内容定稿后再说
+  const reviewTab = findDiffReviewTab(uri.fsPath);
+  if (reviewTab) {
+    L(`审核中静默（待确认，不转码）：${uri.fsPath} 命中标签=${reviewTab.label}`);
+    return;
+  }
   if (normalizePending.has(key) || !shouldWatchFile(uri)) {
     return;
   }
@@ -2885,7 +2982,9 @@ export function activate(context: vscode.ExtensionContext) {
       reopenCooldown.delete(key);
       // 注意：打开事件不做编码归一——旧文件打开时绝不能按 files.encoding
       // 强转（0.10.4 前曾把用户修好的 UTF-8 老文件转回 GBK）
-      scheduleAutoReopen(doc.uri);
+      // allowExistingTab=true：打开事件本身就是「新打开文件/新建标签」，
+      // 这是唯一允许按正确编码尝试重开的时机
+      scheduleAutoReopen(doc.uri, false, true);
     })
   );
   // 外部改写（AI/工具直接写文件）：内核按旧编码标签解码新字节会导致乱码显示，
@@ -2966,16 +3065,9 @@ export function activate(context: vscode.ExtensionContext) {
     // 校验靠下一次文件事件兜底）
   }
 
-  // 覆盖编辑器启动时恢复的已打开标签（不触发 onDidOpenTextDocument）
-  setTimeout(() => {
-    for (const doc of vscode.workspace.textDocuments) {
-      if (doc.uri.scheme === "file") {
-        if (!doc.uri.fsPath.toLowerCase().replace(/\\/g, "/").includes("/encoding-switcher/")) {
-          scheduleAutoReopen(doc.uri);
-        }
-      }
-    }
-  }, 800);
+  // 编辑器启动时恢复的已打开标签属于「标签早就存在」：不重开、不转码，
+  // 即使编码显示不正确，也由用户自行关闭后重新打开（那时才算新开标签）
+  L("启动恢复的已打开标签不重开（标签早已存在）");
 
   // 初次激活时刷新一次
   updateContext();
