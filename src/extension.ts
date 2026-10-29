@@ -1253,6 +1253,73 @@ function isFileOpenInTab(fsPath: string): boolean {
   return false;
 }
 
+function normFsPath(p: string): string {
+  return p.replace(/\\/g, "/").toLowerCase();
+}
+
+// 激活时已存在的标签且尚未加载（典型场景：重启 IDE 后恢复的标签页）。
+// 这类标签被点击加载时只弹提醒，不重开、不转码；只有本次新开标签才允许纠正。
+const restoredLazyTabPaths = new Set<string>();
+const lazyTabWarned = new Set<string>();
+
+function snapshotRestoredTabs(): void {
+  restoredLazyTabPaths.clear();
+  const loaded = new Set<string>();
+  for (const d of vscode.workspace.textDocuments) {
+    if (d.uri.scheme === "file") {
+      loaded.add(normFsPath(d.uri.fsPath));
+    }
+  }
+  for (const group of vscode.window.tabGroups.all) {
+    for (const t of group.tabs) {
+      if (t.input instanceof vscode.TabInputText && t.input.uri.scheme === "file") {
+        const p = normFsPath(t.input.uri.fsPath);
+        if (!loaded.has(p)) {
+          restoredLazyTabPaths.add(p);
+        }
+      }
+    }
+  }
+  L(`启动标签快照：已存在但未加载的标签 ${restoredLazyTabPaths.size} 个`);
+}
+
+function warnRestoredLazyTab(uri: vscode.Uri): void {
+  const key = uri.toString();
+  if (lazyTabWarned.has(key)) {
+    return;
+  }
+  lazyTabWarned.add(key);
+  const name = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
+  L(`重启恢复的标签首次加载：不重开、不转码，仅提醒：${uri.fsPath}`);
+  notifyWithOpenFile(
+    "warn",
+    `编码守护：${name} 的标签页早已存在但此前未加载（多为重启 IDE 后恢复的标签）。` +
+      `为避免自动改写损坏文件，本次不重开、不转码。若编码显示不正确，` +
+      `请关闭该标签后重新打开（新标签）以尝试纠正。`,
+    uri
+  );
+}
+
+// 用户保存时间：用于区分「用户手动转码/保存」与「AI 直接写盘」。
+// 用户刚保存过的文件不自动转码，避免把用户手动选择的新编码又转回去。
+const lastUserSaveMs = new Map<string, number>();
+
+// 打开时登记磁盘编码基线：后续 AI 把整个文件转码时，据此判断原编码并回滚一次
+function recordDiskEncBaseline(uri: vscode.Uri): void {
+  try {
+    const head = headBytes(uri.fsPath, 64 * 1024);
+    if (!head || head.length === 0) {
+      return;
+    }
+    const enc = detectHeadTolerant(head, getDetectionEncodings());
+    if (enc !== "unknown") {
+      setLastEnc(uri.toString(), enc);
+    }
+  } catch {
+    // 读取失败不阻断打开流程
+  }
+}
+
 function scheduleAutoReopen(
   uri: vscode.Uri,
   verifyAll = false,
@@ -1826,6 +1893,15 @@ async function executeRepairInner(
     L(`已放弃自动处理，跳过修复：${uri.fsPath}`);
     return true;
   }
+  // 用户刚保存过（含手动“通过编码保存”/转换）：视为用户意图，不自动转码，
+  // 避免把用户刚选定的新编码又转回旧编码
+  const savedAt = lastUserSaveMs.get(key);
+  if (savedAt && Date.now() - savedAt < 5000) {
+    L(
+      `用户刚保存过该文件（${Date.now() - savedAt}ms 前），不自动转码：${uri.fsPath}`
+    );
+    return true;
+  }
   const name = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
   const ext = fileExt(uri.fsPath);
   const quiet = ext === "log"; // 日志文件通知降级：只记日志不弹窗
@@ -1972,9 +2048,10 @@ async function tryRepairCorrupted(uri: vscode.Uri, full: Buffer): Promise<void> 
     L(`已放弃自动处理，跳过损坏修复检测：${uri.fsPath}`);
     return;
   }
-  // 标签已存在的文件不转码（即使编码显示不正确）：只允许新打开标签时纠正
-  if (isFileOpenInTab(uri.fsPath)) {
-    L(`标签已存在，不转码（仅新打开标签时才纠正编码）：${uri.fsPath}`);
+  // 标签存在但尚未加载（重启恢复、未点击加载）：不转码；
+  // 已加载的标签允许「AI 整体转码单次守护」处理（见 rollbackAiTranscode）
+  if (isFileOpenInTab(uri.fsPath) && !findByUri(uri)) {
+    L(`标签未加载，不转码：${uri.fsPath}`);
     return;
   }
   if (repairing.has(key)) {
@@ -2025,9 +2102,9 @@ async function tryRepairMigrated(
     L(`已放弃自动处理，跳过迁移回滚：${uri.fsPath}`);
     return;
   }
-  // 标签已存在的文件不转码（即使编码显示不正确）
-  if (isFileOpenInTab(uri.fsPath)) {
-    L(`标签已存在，不转码（仅新打开标签时才纠正编码）：${uri.fsPath}`);
+  // 标签存在但尚未加载（重启恢复、未点击加载）不转码；已加载的标签按单次守护处理
+  if (isFileOpenInTab(uri.fsPath) && !findByUri(uri)) {
+    L(`标签未加载，不转码：${uri.fsPath}`);
     return;
   }
   if (repairing.has(key)) {
@@ -2195,6 +2272,46 @@ function sameEncFamily(a: string, b: string): boolean {
   return isGbkLike(a) === isGbkLike(b);
 }
 
+// AI 把已加载文件整体转码（而非用户手动转码/保存）：允许自动守护转回一次。
+// 约束：
+// 1) 仅限已被用户加载（textDocuments 中存在文档）的标签；未加载标签不转码
+// 2) 用户刚保存过（5 秒内）一律接受现状，避免与用户手动编码选择打架
+// 3) 只转一次；再次被打回由 MIGRATE_STRIKES=1 熔断并弹窗，不再二次、多次转码
+async function rollbackAiTranscode(
+  uri: vscode.Uri,
+  full: Buffer,
+  prevEnc: string,
+  currentEnc: string
+): Promise<void> {
+  const key = uri.toString();
+  const savedAt = lastUserSaveMs.get(key);
+  if (savedAt && Date.now() - savedAt < 5000) {
+    L(
+      `用户刚保存过，接受新编码 ${currentEnc}（不转回 ${prevEnc}）：${uri.fsPath}`
+    );
+    return;
+  }
+  if (!isFileOpenInTab(uri.fsPath)) {
+    L(`文件未在标签栏打开，不做 AI 转码回滚：${uri.fsPath}`);
+    return;
+  }
+  if (!findByUri(uri)) {
+    L(`标签未加载，不转码：${uri.fsPath}`);
+    return;
+  }
+  const converted = migrateEncodingBytes(full, currentEnc, prevEnc);
+  if (!converted) {
+    L(
+      `整体转码无法无损转回 ${prevEnc}，保持 ${currentEnc}：${uri.fsPath}`
+    );
+    return;
+  }
+  L(
+    `检测到 AI 整体转码（${prevEnc} → ${currentEnc}），尝试自动转回一次：${uri.fsPath}`
+  );
+  await tryRepairMigrated(uri, full, converted, prevEnc, currentEnc);
+}
+
 async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
   const key = uri.toString();
   let fp = diskFingerprint(uri);
@@ -2207,6 +2324,14 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
   const reviewTab = findDiffReviewTab(uri.fsPath);
   if (reviewTab) {
     L(`审核中静默（待确认，不转码）：${uri.fsPath} 命中标签=${reviewTab.label}`);
+    return;
+  }
+
+  // 标签存在但尚未加载（重启恢复、未点击加载）：不转码、不重开，
+  // 用户点击加载时只弹提醒（见 onDidOpenTextDocument）
+  if (isFileOpenInTab(uri.fsPath) && !findByUri(uri)) {
+    watcherDone.set(key, fp);
+    L(`标签未加载，不转码、不重开：${uri.fsPath}`);
     return;
   }
 
@@ -2401,11 +2526,15 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
       await tryRepairCorrupted(uri, full);
       return;
     }
-    // 无损全量编码变化一律接受现状（0.10.13）：全文合法且含中文、仅编码族
-    // 整体改变（GBK→UTF-8 或反向）时，无论写入者是用户还是 AI/工具，只要
-    // 转换无损就不再回滚——回滚与用户意图打架的损害远大于收益（hmiview.cpp
-    // 状态栏转 UTF-8 被两次转回 GBK）。有损写入已在上方走混合/双重转码修复；
-    // 磁盘违背内容声明的场景由上方声明优先闸门处理，无需在此重复
+    // 无损全量编码变化：用户手动转码/刚保存过的接受现状（0.10.13 规则）；
+    // AI 整体转码（已加载标签且非用户保存）允许自动守护转回一次
+    if (
+      prev &&
+      !sameEncFamily(prev, enc) &&
+      containsCJK(decodeWith(enc, body) ?? "")
+    ) {
+      await rollbackAiTranscode(uri, full, prev, enc);
+    }
     return;
   }
 
@@ -2417,8 +2546,10 @@ async function checkWrittenFile(uri: vscode.Uri): Promise<void> {
     await tryRepairCorrupted(uri, full);
     return;
   }
-  // 无损全量编码变化一律接受现状（0.10.13），理由同 UTF 分支；lastEnc 已
-  // 在前面统一同步为当前编码，后续事件不会重复触发任何回滚
+  // 无损全量编码变化：用户保存接受现状；AI 整体转码只回滚一次（同上）
+  if (prev && !sameEncFamily(prev, enc) && containsCJK(decodeWith(enc, full) ?? "")) {
+    await rollbackAiTranscode(uri, full, prev, enc);
+  }
 }
 
 // ===== AI 新建文件的初始编码归一 =====
@@ -2957,6 +3088,7 @@ export function activate(context: vscode.ExtensionContext) {
     vscode.workspace.onDidSaveTextDocument((doc) => {
       scheduleContextUpdate();
       if (doc.uri.scheme === "file") {
+        lastUserSaveMs.set(doc.uri.toString(), Date.now());
         registerUserSaveEncoding(doc.uri);
       }
     })
@@ -2977,9 +3109,19 @@ export function activate(context: vscode.ExtensionContext) {
         internalReopen.delete(key);
         return;
       }
+      // 重启恢复且此前未加载的旧标签，这次点击加载只提醒：
+      // 不重开、不转码（不论编码显示是否正确）
+      const pathKey = normFsPath(doc.uri.fsPath);
+      if (restoredLazyTabPaths.has(pathKey)) {
+        restoredLazyTabPaths.delete(pathKey);
+        recordDiskEncBaseline(doc.uri); // 登记基线，供后续 AI 整体转码单次回滚
+        warnRestoredLazyTab(doc.uri);
+        return;
+      }
       // 用户真实（重新）打开：清除历史结论，重新完整检测纠正
       autoDone.delete(key);
       reopenCooldown.delete(key);
+      recordDiskEncBaseline(doc.uri);
       // 注意：打开事件不做编码归一——旧文件打开时绝不能按 files.encoding
       // 强转（0.10.4 前曾把用户修好的 UTF-8 老文件转回 GBK）
       // allowExistingTab=true：打开事件本身就是「新打开文件/新建标签」，
@@ -3044,6 +3186,10 @@ export function activate(context: vscode.ExtensionContext) {
       vscode.window.tabGroups.onDidChangeTabs((e) => {
         const uris = new Set<string>();
         for (const t of e.closed) {
+          // 标签已关闭：从「重启恢复未加载」名单移除，之后重新打开算新标签
+          if (t.input instanceof vscode.TabInputText && t.input.uri.scheme === "file") {
+            restoredLazyTabPaths.delete(normFsPath(t.input.uri.fsPath));
+          }
           if (t.input instanceof vscode.TabInputTextDiff) {
             for (const u of [t.input.original, t.input.modified]) {
               if (u.scheme === "file" && shouldWatchFile(u)) {
@@ -3065,9 +3211,9 @@ export function activate(context: vscode.ExtensionContext) {
     // 校验靠下一次文件事件兜底）
   }
 
-  // 编辑器启动时恢复的已打开标签属于「标签早就存在」：不重开、不转码，
-  // 即使编码显示不正确，也由用户自行关闭后重新打开（那时才算新开标签）
-  L("启动恢复的已打开标签不重开（标签早已存在）");
+  // 启动时快照标签：已存在但未加载的标签被点击加载时，只弹提醒、不重开不转码；
+  // 已加载的标签交给「AI 整体转码单次守护」规则
+  snapshotRestoredTabs();
 
   // 初次激活时刷新一次
   updateContext();
