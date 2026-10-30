@@ -855,6 +855,129 @@ async function reopenDisplayedCorrectly(
   return false;
 }
 
+// 回滚后用原始字节的正确编码重开显示：
+// 只对已经加载的标签做显示纠正，不新开标签、不写盘
+async function reopenDisplayWithBytes(
+  uri: vscode.Uri,
+  originalBytes: Buffer,
+  tag: string
+): Promise<void> {
+  if (!findByUri(uri)) {
+    L(`回滚后文件未加载，不新开标签：${uri.fsPath}`);
+    return;
+  }
+  const enc = detectEncoding(originalBytes, getDetectionEncodings());
+  if (enc === "unknown") {
+    L(`回滚后无法识别原始编码，跳过重开显示：${uri.fsPath}`);
+    return;
+  }
+  const text = isUtfFamily(enc)
+    ? originalBytes.toString("utf8")
+    : iconv.decode(originalBytes, enc);
+  const label = vscodeEncodingLabel(enc);
+  L(`回滚后按正确编码重开显示[${tag}]：${uri.fsPath} 编码=${enc}`);
+  try {
+    const ok = await reopenDisplayedCorrectly(uri, text, label);
+    L(`回滚后重开显示[${tag}]${ok ? "成功" : "失败"}：${uri.fsPath}`);
+  } catch (e) {
+    L(`回滚后重开显示异常[${tag}]：${String(e)}`);
+  }
+}
+
+// ===== 当前打开文件的显示体检：只提醒，不重开、不转码 =====
+// 规则：当前点开的文件只要显示内容含乱码特征（U+FFFD / 典型双重转码）
+// 或与磁盘按检测编码解码的内容不一致，一律弹窗提醒；不做任何自动改写。
+const displayWarned = new Map<string, string>(); // uri → 指纹+显示文本哈希
+let displayCheckTimer: NodeJS.Timeout | undefined;
+
+function scheduleDisplayCheck(doc: vscode.TextDocument | undefined): void {
+  if (!doc || doc.uri.scheme !== "file") {
+    return;
+  }
+  const p = doc.uri.fsPath.replace(/\\/g, "/").toLowerCase();
+  if (p.includes("/encoding-switcher/")) {
+    return; // 守护自身源码不体检（防自干扰）
+  }
+  const uri = doc.uri.toString();
+  if (displayCheckTimer) {
+    clearTimeout(displayCheckTimer);
+  }
+  displayCheckTimer = setTimeout(() => {
+    void checkDisplayedEncoding(uri);
+  }, 600);
+}
+
+async function checkDisplayedEncoding(uriText: string): Promise<void> {
+  const uri = vscode.Uri.parse(uriText);
+  const doc = findByUri(uri);
+  if (!doc) {
+    return; // 已关闭
+  }
+  if (doc.isDirty) {
+    return; // 有未保存修改：差异来自用户编辑，不能当编码问题
+  }
+  let bytes: Buffer;
+  try {
+    bytes = fs.readFileSync(uri.fsPath);
+  } catch {
+    return;
+  }
+  if (bytes.length === 0) {
+    return;
+  }
+  const enc = detectEncoding(bytes, getDetectionEncodings());
+  if (enc === "unknown") {
+    return;
+  }
+  const decodeName = isUtfFamily(enc) ? "utf-8" : enc;
+  const ext = fileExt(uri.fsPath);
+  const shown = normalizeText(doc.getText());
+  const hasReplacement = shown.includes("\ufffd");
+  const mojibake = isReversibleMojibakeText(shown);
+  if (!shown) {
+    return;
+  }
+  // 与磁盘解码内容比对：日志/超大文件只比头部，避免追加或大文件卡顿
+  let mismatch = false;
+  const headOnly = ext === "log" || bytes.length > 512 * 1024;
+  if (headOnly) {
+    const diskHeadText = normalizeText(
+      iconv.decode(bytes.subarray(0, 4096), decodeName)
+    );
+    if (diskHeadText.length > 0) {
+      mismatch = shown.slice(0, diskHeadText.length) !== diskHeadText;
+    }
+  } else {
+    const diskText = normalizeText(
+      isUtfFamily(enc) ? bytes.toString("utf8") : iconv.decode(bytes, enc)
+    );
+    mismatch = diskText.length > 0 && shown !== diskText;
+  }
+  if (!hasReplacement && !mojibake && !mismatch) {
+    return;
+  }
+  const stateHash = `${diskFingerprint(uri)}:${crypto
+    .createHash("sha1")
+    .update(shown)
+    .digest("hex")}`;
+  if (displayWarned.get(uriText) === stateHash) {
+    return; // 同一状态已提醒过，避免反复弹窗
+  }
+  displayWarned.set(uriText, stateHash);
+  const name = uri.fsPath.split(/[\\/]/).pop() ?? uri.fsPath;
+  L(
+    `显示体检命中：${uri.fsPath} 磁盘编码=${enc} 替换字符=${hasReplacement} ` +
+      `乱码形态=${mojibake} 与磁盘不一致=${mismatch}`
+  );
+  notifyWithOpenFile(
+    "warn",
+    `编码守护：${name} 的显示内容存在乱码或与磁盘编码不一致（磁盘编码=${enc.toUpperCase()}）。` +
+      `为避免自动改写损坏文件，插件不会自动重开或转码；如需正确显示，` +
+      `请关闭该标签后重新打开，或手动指定编码查看。`,
+    uri
+  );
+}
+
 // 关闭某文件所有干净的乱码编辑器（重开失败后的磁盘保护）
 async function closeMojibakeEditors(uri: vscode.Uri): Promise<void> {
   for (const d of [...vscode.workspace.textDocuments]) {
@@ -957,9 +1080,11 @@ async function convertTo(targetEnc: string, targetLabel: string): Promise<void> 
   const convCheck = verifyWrittenText(filePath, text, targetEnc);
   if (!convCheck.ok) {
     L(`转换校验未通过：${filePath} ${convCheck.detail}`);
-    markGiveUp(doc.uri, "转换校验未通过");
     restoreOriginalBytes(filePath, bytes, "转换校验未通过");
+    markGiveUp(doc.uri, "转换校验未通过");
     notifyGiveUp(doc.uri, "编码转换", "写盘内容与预期不一致");
+    // 回滚后按原始字节的正确编码重开显示，避免标签停在转换后的错误内容
+    await reopenDisplayWithBytes(doc.uri, bytes, "转换回滚");
     return;
   }
   L(`转换校验通过：${filePath} 目标编码=${targetEnc}`);
@@ -1045,6 +1170,8 @@ async function convertTo(targetEnc: string, targetLabel: string): Promise<void> 
         `保存后磁盘又被改为 ${finalEnc.toUpperCase()}`,
         "磁盘保持当前内容未再改写"
       );
+      // 磁盘已是别的编码：按磁盘实际字节的正确编码重开显示
+      await reopenDisplayWithBytes(doc.uri, finalBytes, "终验不一致");
       return;
     }
     finishClaim(filePath, targetEnc);
@@ -1982,6 +2109,8 @@ async function executeRepairInner(
       }
       markGiveUp(uri, "修复校验未通过");
       notifyGiveUp(uri, "编码修复", "写盘内容与预期不一致");
+      // 回滚后按原始字节的正确编码重开显示（仅已加载标签）
+      await reopenDisplayWithBytes(uri, detectedBytes, "修复回滚");
       return true;
     }
   } catch (e) {
@@ -2975,6 +3104,7 @@ function normalizeNewFileEncoding(uri: vscode.Uri): void {
       restoreOriginalBytes(uri.fsPath, bytes, "新文件归一校验未通过");
       markGiveUp(uri, "新文件归一校验未通过");
       notifyGiveUp(uri, "新文件编码归一", "写盘内容与预期不一致");
+      void reopenDisplayWithBytes(uri, bytes, "归一回滚");
       return;
     }
     finishClaim(uri.fsPath, defEnc);
@@ -3080,7 +3210,11 @@ export function activate(context: vscode.ExtensionContext) {
   };
 
   context.subscriptions.push(
-    vscode.window.onDidChangeActiveTextEditor(() => scheduleContextUpdate())
+    vscode.window.onDidChangeActiveTextEditor((editor) => {
+      scheduleContextUpdate();
+      // 当前点开的文件做显示体检：乱码/不一致一律弹窗提醒（不重开、不转码）
+      scheduleDisplayCheck(editor?.document);
+    })
   );
   // 保存也可能改变磁盘编码（如系统自带“通过编码保存”），需同步刷新按钮；
   // 同时把用户主动保存后的磁盘编码登记为用户意图，防止迁移回滚误杀
@@ -3116,6 +3250,8 @@ export function activate(context: vscode.ExtensionContext) {
         restoredLazyTabPaths.delete(pathKey);
         recordDiskEncBaseline(doc.uri); // 登记基线，供后续 AI 整体转码单次回滚
         warnRestoredLazyTab(doc.uri);
+        // 加载完成后检查显示：乱码/不一致再补一次弹窗提醒（仍不重开、不转码）
+        scheduleDisplayCheck(doc);
         return;
       }
       // 用户真实（重新）打开：清除历史结论，重新完整检测纠正
@@ -3127,6 +3263,7 @@ export function activate(context: vscode.ExtensionContext) {
       // allowExistingTab=true：打开事件本身就是「新打开文件/新建标签」，
       // 这是唯一允许按正确编码尝试重开的时机
       scheduleAutoReopen(doc.uri, false, true);
+      scheduleDisplayCheck(doc);
     })
   );
   // 外部改写（AI/工具直接写文件）：内核按旧编码标签解码新字节会导致乱码显示，
@@ -3142,6 +3279,7 @@ export function activate(context: vscode.ExtensionContext) {
         if (!doc.uri.fsPath.toLowerCase().replace(/\\/g, "/").includes("/encoding-switcher/")) {
           scheduleAutoReopen(doc.uri, true);
           void encodingView?.syncWithDisk(doc.uri.fsPath);
+          scheduleDisplayCheck(doc); // 外部改写后显示若仍不对，弹窗提醒
         }
       } else if (doc.uri.scheme === VIEW_SCHEME) {
         void encodingView?.syncWithDisk(doc.uri.fsPath);
@@ -3214,6 +3352,9 @@ export function activate(context: vscode.ExtensionContext) {
   // 启动时快照标签：已存在但未加载的标签被点击加载时，只弹提醒、不重开不转码；
   // 已加载的标签交给「AI 整体转码单次守护」规则
   snapshotRestoredTabs();
+
+  // 首次激活即对当前活动文件做显示体检（乱码/不一致弹窗提醒）
+  scheduleDisplayCheck(vscode.window.activeTextEditor?.document);
 
   // 初次激活时刷新一次
   updateContext();
