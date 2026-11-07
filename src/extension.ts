@@ -57,9 +57,12 @@ function openLogFile(): void {
   }
 }
 
-// 文本归一化：统一换行、去掉 BOM，便于与预期解码结果比对
+// 文本归一化：统一换行（CRLF 与孤立 CR）、去掉 BOM，便于与预期解码结果比对。
+// 必须处理孤立 CR：VSCode 文本模型会把 CR-only 换行当作换行并在加载时改写，
+// 而按编码从磁盘解码出的文本保留原字节中的孤立 CR；只归一 CRLF 会让两边换行
+// 表示不同，全文比对永不相等，从而误判“重开失败 / 编码歧义”。
 function normalizeText(s: string): string {
-  return s.replace(/\r\n/g, "\n").replace(/^\uFEFF/, "");
+  return s.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/^\uFEFF/, "");
 }
 
 function findByUri(uri: vscode.Uri): vscode.TextDocument | undefined {
@@ -415,7 +418,9 @@ async function reopenDocWithEncoding(
       preserveFocus: true,
     });
     markInternalReopen(uri);
-    await vscode.commands.executeCommand("workbench.action.files.revertFile");
+    // 命令 ID 应为 workbench.action.files.revert；旧写法 revertFile 在 VSCode 1.142
+    // 中不存在（运行日志：command 'workbench.action.files.revertFile' not found）
+    await vscode.commands.executeCommand("workbench.action.files.revert");
     L(`已按 ${encLabel} 重载文件（files.encoding 临时切换方案）：${uri.fsPath}`);
   } finally {
     if (!externalOv) {
